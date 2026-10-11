@@ -376,6 +376,11 @@ public:
     void memory_barrier_compute_to_compute();
     void memory_barrier_transfer_to_compute();
     void memory_barrier_transfer_to_graphics();
+
+private:
+
+    struct Impl;
+    Impl* m_impl = nullptr;
 };
 
 } // namespace vulk
