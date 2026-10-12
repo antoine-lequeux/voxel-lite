@@ -162,6 +162,9 @@ enum class CompareOp : u8
 struct ContextConfig
 {
     std::string_view app_name = "";
+    u32 app_version_major = 0;
+    u32 app_version_minor = 0;
+    u32 app_version_patch = 0;
     bool enable_validation = true;
     bool vsync = true;
     u32 frames_in_flight = 2;

@@ -605,8 +605,8 @@ struct VulkanContext::Impl
         }
         else
         {
-            builder.set_desired_present_mode(VK_PRESENT_MODE_MAILBOX_KHR)
-                .add_fallback_present_mode(VK_PRESENT_MODE_IMMEDIATE_KHR)
+            builder.set_desired_present_mode(VK_PRESENT_MODE_IMMEDIATE_KHR)
+                .add_fallback_present_mode(VK_PRESENT_MODE_MAILBOX_KHR)
                 .add_fallback_present_mode(VK_PRESENT_MODE_FIFO_KHR);
         }
 
@@ -756,13 +756,20 @@ bool VulkanContext::init(SDL_Window* window, const ContextConfig& config)
     m_impl->headless = (window == nullptr);
 
     vkb::InstanceBuilder inst_builder;
-    inst_builder.set_app_name(config.app_name.data()).require_api_version(1, 3, 0);
+    inst_builder.set_app_name(config.app_name.data())
+        .set_app_version(config.app_version_major, config.app_version_minor, config.app_version_patch)
+        .require_api_version(1, 3, 0);
 
-    if (config.enable_validation) inst_builder.request_validation_layers().use_default_debug_messenger();
+    if (config.enable_validation)
+    {
+        inst_builder.request_validation_layers().use_default_debug_messenger().set_debug_messenger_type(
+            VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT
+        );
+    }
 
     if (window != nullptr)
     {
-        Uint32 ext_count = 0;
+        u32 ext_count = 0;
         const char* const* sdl_exts = SDL_Vulkan_GetInstanceExtensions(&ext_count);
         if (sdl_exts == nullptr)
         {
@@ -770,7 +777,7 @@ bool VulkanContext::init(SDL_Window* window, const ContextConfig& config)
             shutdown();
             return false;
         }
-        for (Uint32 i = 0; i < ext_count; ++i) inst_builder.enable_extension(sdl_exts[i]);
+        for (u32 i = 0; i < ext_count; ++i) inst_builder.enable_extension(sdl_exts[i]);
     }
     else
     {
@@ -1531,9 +1538,11 @@ BufferHandle VulkanContext::get_or_create_quad_index_buffer(u32 max_quads)
 {
     if (m_impl == nullptr || max_quads == 0) return BufferHandle::invalid();
 
-    if (m_impl->quad_index_buffer.is_valid() && m_impl->quad_index_capacity >= max_quads) return m_impl->quad_index_buffer;
-
-    if (m_impl->quad_index_buffer.is_valid()) destroy_buffer(m_impl->quad_index_buffer);
+    if (m_impl->quad_index_buffer.is_valid())
+    {
+        if (m_impl->quad_index_capacity >= max_quads) return m_impl->quad_index_buffer;
+        destroy_buffer(m_impl->quad_index_buffer);
+    }
 
     std::vector<u32> indices(static_cast<usize>(max_quads) * 6u);
     for (u32 q = 0; q < max_quads; ++q)
