@@ -42,7 +42,9 @@
     #pragma warning(push, 0)
 #endif
 
-#define VK_BOOTSTRAP_NO_EXCEPTIONS
+#ifndef VK_BOOTSTRAP_NO_EXCEPTIONS
+    #define VK_BOOTSTRAP_NO_EXCEPTIONS
+#endif
 #include <VkBootstrap.h>
 
 #define VMA_IMPLEMENTATION
