@@ -40,7 +40,7 @@ endif()
 
 set(BUILD_DIR "${CMAKE_CURRENT_LIST_DIR}/build/${COMP}-${ARCH}-${CONFIG}")
 
-set(TARGET_NAME "voxel_engine")
+set(TARGET_NAME "voxel-lite")
 set(EXE_SUFFIX "")
 if(WIN32)
     set(EXE_SUFFIX ".exe")

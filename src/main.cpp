@@ -1,5 +1,7 @@
 #include "engine/engine.hpp"
 
+#include <mimalloc-new-delete.h>
+
 int main()
 {
     vl::Engine engine;
