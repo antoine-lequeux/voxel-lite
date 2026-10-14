@@ -1,6 +1,7 @@
 #pragma once
 
 #include "engine/camera.hpp"
+#include "engine/chunk.hpp"
 #include "renderer/vulkancontext.hpp"
 
 struct SDL_Window;
@@ -26,7 +27,8 @@ public:
 
 private:
 
-    bool init_cube_resources();
+    bool init_chunk_resources();
+    bool rebuild_chunk();
     void process_events();
     void update(f32 dt);
     void render();
@@ -35,10 +37,12 @@ private:
     vulk::VulkanContext m_vulkan_context {};
     Camera m_camera {};
 
-    vulk::BufferHandle m_cube_vertex_buffer {};
-    vulk::BufferHandle m_cube_index_buffer {};
-    vulk::ShaderHandle m_cube_shader {};
-    vulk::PipelineHandle m_cube_pipeline {};
+    Chunk m_chunk {};
+    ChunkMesh m_chunk_mesh {};
+
+    vulk::BufferHandle m_block_material_buffer {};
+    vulk::ShaderHandle m_chunk_shader {};
+    vulk::PipelineHandle m_chunk_pipeline {};
 
     f32 m_elapsed_time = 0.0f;
     bool m_running = false;

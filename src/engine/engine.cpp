@@ -1,5 +1,7 @@
 #include "engine.hpp"
 
+#include "chunk_generator.hpp"
+
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_scancode.h>
 #include <glm/glm.hpp>
@@ -14,32 +16,17 @@ namespace vl
 namespace
 {
 
-// Matches CubeVertex in cube.slang
-struct CubeVertex
-{
-    glm::vec3 position;
-    f32 ao;
-    glm::vec3 normal;
-    u32 face_id;
-    glm::vec3 color;
-    f32 roughness;
-    glm::vec2 uv;
-    glm::vec2 pad;
-};
-
-static_assert(sizeof(CubeVertex) == 64, "CubeVertex must match 64-byte shader layout");
-
-// Matches PushConstants in cube.slang
-struct CubePushConstants
+// Matches PushConstants in chunk.slang
+struct ChunkPushConstants
 {
     glm::mat4 mvp;
-    glm::vec4 model_offset_and_time;
+    glm::vec4 chunk_origin_and_time;
     glm::vec4 camera_pos;
     u64 vertex_buffer_address;
-    u64 padding;
+    u64 material_buffer_address;
 };
 
-static_assert(sizeof(CubePushConstants) <= 128, "CubePushConstants must fit within 128 bytes");
+static_assert(sizeof(ChunkPushConstants) <= 128, "ChunkPushConstants must fit within 128 bytes");
 
 } // namespace
 
@@ -79,9 +66,15 @@ bool Engine::init()
         return false;
     }
 
-    if (!init_cube_resources())
+    // Position the camera
+    m_camera.position = glm::vec3 {16.0f, 25.0f, 44.0f};
+    m_camera.yaw_degrees = -90.0f;
+    m_camera.pitch_degrees = -24.0f;
+    m_camera.move_speed = 12.0f;
+
+    if (!init_chunk_resources())
     {
-        std::println(stderr, "[Engine] Failed to initialize cube GPU resources");
+        std::println(stderr, "[Engine] Failed to initialize chunk GPU resources");
         return false;
     }
 
@@ -89,97 +82,22 @@ bool Engine::init()
     return true;
 }
 
-bool Engine::init_cube_resources()
+bool Engine::init_chunk_resources()
 {
-    constexpr glm::vec3 color_grass {0.36f, 0.76f, 0.28f};
-    constexpr glm::vec3 color_dirt {0.52f, 0.37f, 0.24f};
-
-    const auto make_face = [](glm::vec3 v0, glm::vec3 v1, glm::vec3 v2, glm::vec3 v3, glm::vec3 normal, glm::vec3 color,
-                              u32 face_id) constexpr -> std::array<CubeVertex, 4> {
-        return {{
-            {.position = v0,
-             .ao = 1.00f,
-             .normal = normal,
-             .face_id = face_id,
-             .color = color,
-             .roughness = 0.8f,
-             .uv = {0.0f, 0.0f},
-             .pad = {0.0f, 0.0f}},
-            {.position = v1,
-             .ao = 1.00f,
-             .normal = normal,
-             .face_id = face_id,
-             .color = color,
-             .roughness = 0.8f,
-             .uv = {1.0f, 0.0f},
-             .pad = {0.0f, 0.0f}},
-            {.position = v2,
-             .ao = 1.00f,
-             .normal = normal,
-             .face_id = face_id,
-             .color = color,
-             .roughness = 0.8f,
-             .uv = {1.0f, 1.0f},
-             .pad = {0.0f, 0.0f}},
-            {.position = v3,
-             .ao = 1.00f,
-             .normal = normal,
-             .face_id = face_id,
-             .color = color,
-             .roughness = 0.8f,
-             .uv = {0.0f, 1.0f},
-             .pad = {0.0f, 0.0f}},
-        }};
-    };
-
-    // Initialize 6 faces with 4 vertices each
-    const std::array<std::array<CubeVertex, 4>, 6> faces {{
-        // +Z (front face)
-        make_face(
-            {-0.5f, -0.5f, 0.5f}, {0.5f, -0.5f, 0.5f}, {0.5f, 0.5f, 0.5f}, {-0.5f, 0.5f, 0.5f}, {0.0f, 0.0f, 1.0f}, color_grass, 0
-        ),
-        // -Z (back face)
-        make_face(
-            {0.5f, -0.5f, -0.5f}, {-0.5f, -0.5f, -0.5f}, {-0.5f, 0.5f, -0.5f}, {0.5f, 0.5f, -0.5f}, {0.0f, 0.0f, -1.0f},
-            color_grass, 1
-        ),
-        // +X (right face)
-        make_face(
-            {0.5f, -0.5f, 0.5f}, {0.5f, -0.5f, -0.5f}, {0.5f, 0.5f, -0.5f}, {0.5f, 0.5f, 0.5f}, {1.0f, 0.0f, 0.0f}, color_grass, 2
-        ),
-        // -X (left face)
-        make_face(
-            {-0.5f, -0.5f, -0.5f}, {-0.5f, -0.5f, 0.5f}, {-0.5f, 0.5f, 0.5f}, {-0.5f, 0.5f, -0.5f}, {-1.0f, 0.0f, 0.0f},
-            color_grass, 3
-        ),
-        // +Y (top face)
-        make_face(
-            {-0.5f, 0.5f, 0.5f}, {0.5f, 0.5f, 0.5f}, {0.5f, 0.5f, -0.5f}, {-0.5f, 0.5f, -0.5f}, {0.0f, 1.0f, 0.0f}, color_grass, 4
-        ),
-        // -Y (bottom face)
-        make_face(
-            {-0.5f, -0.5f, -0.5f}, {0.5f, -0.5f, -0.5f}, {0.5f, -0.5f, 0.5f}, {-0.5f, -0.5f, 0.5f}, {0.0f, -1.0f, 0.0f},
-            color_dirt, 5
-        ),
-    }};
-
-    // Upload cube vertices into VRAM with Shader Device Address enabled for vertex pulling
-    m_cube_vertex_buffer = m_vulkan_context.create_buffer(
-        sizeof(faces), vulk::BufferUsage::Storage | vulk::BufferUsage::ShaderDeviceAddress, vulk::MemoryUsage::GpuOnly,
-        faces.data()
+    // Upload the block registry material table once to GPU memory
+    constexpr auto gpu_materials = build_gpu_block_materials();
+    m_block_material_buffer = m_vulkan_context.create_buffer(
+        sizeof(gpu_materials), vulk::BufferUsage::Storage | vulk::BufferUsage::ShaderDeviceAddress, vulk::MemoryUsage::GpuOnly,
+        gpu_materials.data()
     );
+    if (!m_block_material_buffer.is_valid()) return false;
 
-    // Use the global shared quad index buffer for cube faces
-    m_cube_index_buffer = m_vulkan_context.get_or_create_quad_index_buffer(6);
-
-    if (!m_cube_vertex_buffer.is_valid() || !m_cube_index_buffer.is_valid()) return false;
-
-    m_cube_shader = m_vulkan_context.create_shader_from_file("cube.spirv");
-    if (!m_cube_shader.is_valid()) return false;
+    m_chunk_shader = m_vulkan_context.create_shader_from_file("chunk.spirv");
+    if (!m_chunk_shader.is_valid()) return false;
 
     vulk::GraphicsPipelineDesc pipe_desc {};
-    pipe_desc.vertex_shader = m_cube_shader;
-    pipe_desc.fragment_shader = m_cube_shader;
+    pipe_desc.vertex_shader = m_chunk_shader;
+    pipe_desc.fragment_shader = m_chunk_shader;
     pipe_desc.vertex_entry = "vertexMain";
     pipe_desc.fragment_entry = "fragmentMain";
     pipe_desc.topology = vulk::PrimitiveTopology::TriangleList;
@@ -189,10 +107,36 @@ bool Engine::init_cube_resources()
     pipe_desc.depth_test = true;
     pipe_desc.depth_write = true;
     pipe_desc.depth_compare = vulk::CompareOp::LessOrEqual;
-    pipe_desc.push_constant_size = sizeof(CubePushConstants);
+    pipe_desc.push_constant_size = sizeof(ChunkPushConstants);
 
-    m_cube_pipeline = m_vulkan_context.create_graphics_pipeline(pipe_desc);
-    return m_cube_pipeline.is_valid();
+    m_chunk_pipeline = m_vulkan_context.create_graphics_pipeline(pipe_desc);
+    if (!m_chunk_pipeline.is_valid()) return false;
+
+    return rebuild_chunk();
+}
+
+bool Engine::rebuild_chunk()
+{
+    const f64 freq = static_cast<f64>(SDL_GetPerformanceFrequency());
+
+    const u64 t0 = SDL_GetPerformanceCounter();
+    ChunkGenerator::generate(m_chunk);
+    const u64 t1 = SDL_GetPerformanceCounter();
+    m_chunk.generate_mesh(m_chunk_mesh);
+    const u64 t2 = SDL_GetPerformanceCounter();
+
+    if (!m_chunk_mesh.upload_to_gpu(m_vulkan_context)) return false;
+
+    const f64 gen_us = static_cast<f64>(t1 - t0) * 1000000.0 / freq;
+    const f64 mesh_us = static_cast<f64>(t2 - t1) * 1000000.0 / freq;
+    const f64 vram_kb = static_cast<f64>(m_chunk_mesh.vertices.size() * sizeof(PackedVertex)) / 1024.0;
+
+    std::println(
+        "[Chunk] {} blocks -> {} quads ({} verts, {:.2f} KB) | gen: {:.1f} us, mesh: {:.1f} us", m_chunk.count_non_air_blocks(),
+        m_chunk_mesh.quad_count, m_chunk_mesh.vertices.size(), vram_kb, gen_us, mesh_us
+    );
+
+    return true;
 }
 
 void Engine::process_events()
@@ -273,7 +217,7 @@ void Engine::update(f32 dt)
     if (glm::dot(move_dir, move_dir) > 0.0001f)
     {
         move_dir = glm::normalize(move_dir);
-        const f32 speed = keys[SDL_SCANCODE_LSHIFT] ? (m_camera.move_speed * m_camera.sprint_multiplier) : m_camera.move_speed;
+        const f32 speed = keys[SDL_SCANCODE_LCTRL] ? (m_camera.move_speed * m_camera.sprint_multiplier) : m_camera.move_speed;
         m_camera.position += move_dir * (speed * dt);
     }
 }
@@ -283,23 +227,28 @@ void Engine::render()
     if (!m_vulkan_context.begin_frame()) return;
 
     vulk::RenderPassInfo pass_info {};
-    pass_info.clear_color = {0.42f, 0.62f, 0.88f, 1.0f}; // Sky color
+    pass_info.clear_color = {0.47f, 0.65f, 1.0f, 1.0f}; // Sky color
     pass_info.clear_depth = 1.0f;
 
     m_vulkan_context.begin_rendering(pass_info);
 
-    m_vulkan_context.bind_pipeline(m_cube_pipeline);
-    m_vulkan_context.bind_index_buffer_u32(m_cube_index_buffer);
+    if (!m_chunk_mesh.empty() && m_chunk_mesh.vertex_buffer.is_valid())
+    {
+        m_vulkan_context.bind_pipeline(m_chunk_pipeline);
 
-    CubePushConstants pc {};
-    pc.mvp = m_camera.view_projection_matrix(m_vulkan_context.get_aspect_ratio());
-    pc.model_offset_and_time = glm::vec4 {0.0f, 0.0f, 0.0f, m_elapsed_time};
-    pc.camera_pos = glm::vec4 {m_camera.position, 1.0f};
-    pc.vertex_buffer_address = m_vulkan_context.get_buffer_device_address(m_cube_vertex_buffer);
-    pc.padding = 0;
+        const vulk::BufferHandle quad_ibo = m_vulkan_context.get_or_create_quad_index_buffer(m_chunk_mesh.quad_count);
+        m_vulkan_context.bind_index_buffer_u32(quad_ibo);
 
-    m_vulkan_context.push_constants(pc);
-    m_vulkan_context.draw_indexed(36);
+        ChunkPushConstants pc {};
+        pc.mvp = m_camera.view_projection_matrix(m_vulkan_context.get_aspect_ratio());
+        pc.chunk_origin_and_time = glm::vec4 {m_chunk.world_origin(), m_elapsed_time};
+        pc.camera_pos = glm::vec4 {m_camera.position, 1.0f};
+        pc.vertex_buffer_address = m_vulkan_context.get_buffer_device_address(m_chunk_mesh.vertex_buffer);
+        pc.material_buffer_address = m_vulkan_context.get_buffer_device_address(m_block_material_buffer);
+
+        m_vulkan_context.push_constants(pc);
+        m_vulkan_context.draw_indexed(m_chunk_mesh.index_count());
+    }
 
     m_vulkan_context.end_rendering();
     m_vulkan_context.end_frame();
@@ -344,9 +293,10 @@ void Engine::shutdown()
 
     m_vulkan_context.wait_idle();
 
-    if (m_cube_pipeline.is_valid()) m_vulkan_context.destroy_pipeline(m_cube_pipeline);
-    if (m_cube_shader.is_valid()) m_vulkan_context.destroy_shader(m_cube_shader);
-    if (m_cube_vertex_buffer.is_valid()) m_vulkan_context.destroy_buffer(m_cube_vertex_buffer);
+    m_chunk_mesh.destroy_gpu_resources(m_vulkan_context);
+    if (m_block_material_buffer.is_valid()) m_vulkan_context.destroy_buffer(m_block_material_buffer);
+    if (m_chunk_pipeline.is_valid()) m_vulkan_context.destroy_pipeline(m_chunk_pipeline);
+    if (m_chunk_shader.is_valid()) m_vulkan_context.destroy_shader(m_chunk_shader);
 
     m_vulkan_context.shutdown();
 
