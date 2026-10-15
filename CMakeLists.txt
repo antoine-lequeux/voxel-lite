@@ -169,7 +169,7 @@ target_link_libraries(ImGui PRIVATE SDL3::SDL3 volk::volk_headers Vulkan::Header
 add_executable(${PROJECT_NAME}
     src/main.cpp
     src/engine/chunk.cpp
-    src/engine/chunk_generator.cpp
+    src/engine/chunkgenerator.cpp
     src/engine/engine.cpp
     src/renderer/vulkancontext.cpp
 )

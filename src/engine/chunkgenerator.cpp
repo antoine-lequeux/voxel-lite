@@ -1,4 +1,4 @@
-#include "engine/chunk_generator.hpp"
+#include "engine/chunkgenerator.hpp"
 #include "block.hpp"
 #include "engine/chunk.hpp"
 

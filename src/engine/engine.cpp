@@ -1,6 +1,6 @@
 #include "engine.hpp"
 
-#include "chunk_generator.hpp"
+#include "chunkgenerator.hpp"
 
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_scancode.h>
