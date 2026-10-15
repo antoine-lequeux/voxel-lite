@@ -1,6 +1,6 @@
 #include "engine.hpp"
 
-#include "chunkgenerator.hpp"
+#include "engine/worldmanager.hpp"
 
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_scancode.h>
@@ -8,6 +8,7 @@
 
 #include <array>
 #include <format>
+#include <memory>
 #include <print>
 
 namespace vl
@@ -78,6 +79,8 @@ bool Engine::init()
         return false;
     }
 
+    m_manager = std::make_unique<WorldManager>();
+
     m_running = true;
     return true;
 }
@@ -110,40 +113,7 @@ bool Engine::init_chunk_resources()
     pipe_desc.push_constant_size = sizeof(ChunkPushConstants);
 
     m_chunk_pipeline = m_vulkan_context.create_graphics_pipeline(pipe_desc);
-    if (!m_chunk_pipeline.is_valid()) return false;
-
-    return rebuild_chunk();
-}
-
-bool Engine::rebuild_chunk()
-{
-    const f64 freq = static_cast<f64>(SDL_GetPerformanceFrequency());
-
-    const u64 t0 = SDL_GetPerformanceCounter();
-    ChunkGenerator::generate(m_chunk);
-    const u64 t1 = SDL_GetPerformanceCounter();
-    m_chunk.generate_mesh(m_chunk_mesh);
-    const u64 t2 = SDL_GetPerformanceCounter();
-
-    if (!m_chunk_mesh.upload_to_gpu(m_vulkan_context)) return false;
-
-    const f64 gen_us = static_cast<f64>(t1 - t0) * 1000000.0 / freq;
-    const f64 mesh_us = static_cast<f64>(t2 - t1) * 1000000.0 / freq;
-    const f64 vram_kb = static_cast<f64>(m_chunk_mesh.vertices.size() * sizeof(PackedVertex)) / 1024.0;
-
-    std::println(
-        "[Chunk] {} blocks -> {} quads ({} verts, {:.2f} KB) | gen: {:.1f} us, mesh: {:.1f} us", m_chunk.count_non_air_blocks(),
-        m_chunk_mesh.quad_count, m_chunk_mesh.vertices.size(), vram_kb, gen_us, mesh_us
-    );
-
-    std::println("has portal Left:  {}", m_chunk.has_portal(Direction::Left));
-    std::println("has portal Right: {}", m_chunk.has_portal(Direction::Right));
-    std::println("has portal Up:    {}", m_chunk.has_portal(Direction::Up));
-    std::println("has portal Down:  {}", m_chunk.has_portal(Direction::Down));
-    std::println("has portal Back:  {}", m_chunk.has_portal(Direction::Back));
-    std::println("has portal Front: {}", m_chunk.has_portal(Direction::Front));
-
-    return true;
+    return m_chunk_pipeline.is_valid();
 }
 
 void Engine::process_events()
@@ -204,8 +174,14 @@ void Engine::update(f32 dt)
 {
     m_elapsed_time += dt;
 
-    i32 num_keys = 0;
-    const bool* keys = SDL_GetKeyboardState(&num_keys);
+    handle_inputs(dt);
+
+    m_manager->update(m_camera.position, m_vulkan_context);
+}
+
+void Engine::handle_inputs(f32 dt)
+{
+    const bool* keys = SDL_GetKeyboardState(nullptr);
     if (keys == nullptr) return;
 
     // Player movement
@@ -239,22 +215,25 @@ void Engine::render()
 
     m_vulkan_context.begin_rendering(pass_info);
 
-    if (!m_chunk_mesh.empty() && m_chunk_mesh.vertex_buffer.is_valid())
+    for (const auto& [chunk, mesh] : m_manager->get_active_chunks())
     {
-        m_vulkan_context.bind_pipeline(m_chunk_pipeline);
+        if (!mesh.empty() && mesh.vertex_buffer.is_valid())
+        {
+            m_vulkan_context.bind_pipeline(m_chunk_pipeline);
 
-        const vulk::BufferHandle quad_ibo = m_vulkan_context.get_or_create_quad_index_buffer(m_chunk_mesh.quad_count);
-        m_vulkan_context.bind_index_buffer_u32(quad_ibo);
+            const vulk::BufferHandle quad_ibo = m_vulkan_context.get_or_create_quad_index_buffer(mesh.quad_count);
+            m_vulkan_context.bind_index_buffer_u32(quad_ibo);
 
-        ChunkPushConstants pc {};
-        pc.mvp = m_camera.view_projection_matrix(m_vulkan_context.get_aspect_ratio());
-        pc.chunk_origin_and_time = glm::vec4 {m_chunk.world_origin(), m_elapsed_time};
-        pc.camera_pos = glm::vec4 {m_camera.position, 1.0f};
-        pc.vertex_buffer_address = m_vulkan_context.get_buffer_device_address(m_chunk_mesh.vertex_buffer);
-        pc.material_buffer_address = m_vulkan_context.get_buffer_device_address(m_block_material_buffer);
+            ChunkPushConstants pc {};
+            pc.mvp = m_camera.view_projection_matrix(m_vulkan_context.get_aspect_ratio());
+            pc.chunk_origin_and_time = glm::vec4 {chunk.world_origin(), m_elapsed_time};
+            pc.camera_pos = glm::vec4 {m_camera.position, 1.0f};
+            pc.vertex_buffer_address = m_vulkan_context.get_buffer_device_address(mesh.vertex_buffer);
+            pc.material_buffer_address = m_vulkan_context.get_buffer_device_address(m_block_material_buffer);
 
-        m_vulkan_context.push_constants(pc);
-        m_vulkan_context.draw_indexed(m_chunk_mesh.index_count());
+            m_vulkan_context.push_constants(pc);
+            m_vulkan_context.draw_indexed(mesh.index_count());
+        }
     }
 
     m_vulkan_context.end_rendering();
@@ -300,7 +279,8 @@ void Engine::shutdown()
 
     m_vulkan_context.wait_idle();
 
-    m_chunk_mesh.destroy_gpu_resources(m_vulkan_context);
+    for (const auto& [_, mesh] : m_manager->get_active_chunks()) mesh.destroy_gpu_resources(m_vulkan_context);
+
     if (m_block_material_buffer.is_valid()) m_vulkan_context.destroy_buffer(m_block_material_buffer);
     if (m_chunk_pipeline.is_valid()) m_vulkan_context.destroy_pipeline(m_chunk_pipeline);
     if (m_chunk_shader.is_valid()) m_vulkan_context.destroy_shader(m_chunk_shader);

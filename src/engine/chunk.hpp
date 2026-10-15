@@ -11,9 +11,9 @@
 namespace vl
 {
 
-constexpr u32 CHUNK_SIZE = 32;
-constexpr u32 CHUNK_AREA = CHUNK_SIZE * CHUNK_SIZE;
-constexpr u32 CHUNK_VOLUME = CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE;
+constexpr i32 CHUNK_SIZE = 32;
+constexpr i32 CHUNK_AREA = CHUNK_SIZE * CHUNK_SIZE;
+constexpr i32 CHUNK_VOLUME = CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE;
 
 // Bit layout:
 //   Bits  0..5  (6 bits) -> Local X position [0..32]
@@ -66,16 +66,16 @@ struct ChunkNeighbors
     const Chunk* front = nullptr; // +Z
 };
 
-class Chunk
+class alignas(64) Chunk
 {
 public:
 
     [[nodiscard]] constexpr glm::vec3 world_origin() const
     {
         return glm::vec3 {
-            static_cast<f32>(m_coord.x * static_cast<i32>(CHUNK_SIZE)),
-            static_cast<f32>(m_coord.y * static_cast<i32>(CHUNK_SIZE)),
-            static_cast<f32>(m_coord.z * static_cast<i32>(CHUNK_SIZE)),
+            static_cast<f32>(coord.x * CHUNK_SIZE),
+            static_cast<f32>(coord.y * CHUNK_SIZE),
+            static_cast<f32>(coord.z * CHUNK_SIZE),
         };
     }
 
@@ -224,16 +224,18 @@ public:
     // Generates the visible surface mesh
     void generate_mesh(ChunkMesh& out_mesh, const ChunkNeighbors& neighbors = {}) const;
 
-private:
-
-    // Flat array for contiguous memory
-    std::array<BlockID, CHUNK_VOLUME> m_blocks {};
-
     // Chunk position in chunk-grid coordinates
-    glm::ivec3 m_coord {0, 0, 0};
+    glm::ivec3 coord {0, 0, 0};
+
+    bool mesh_dirty = false;
+
+private:
 
     // 6 first bits: 1 if at least one non-opaque block for the corresponding face (L, R, D, U, B, F)
     u8 m_portal_mask = 0b11111100;
+
+    // Flat array for contiguous memory
+    std::array<BlockID, CHUNK_VOLUME> m_blocks {};
 };
 
 } // namespace vl

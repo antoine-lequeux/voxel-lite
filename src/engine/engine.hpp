@@ -1,8 +1,10 @@
 #pragma once
 
 #include "engine/camera.hpp"
-#include "engine/chunk.hpp"
+#include "engine/worldmanager.hpp"
 #include "renderer/vulkancontext.hpp"
+
+#include <memory>
 
 struct SDL_Window;
 
@@ -31,14 +33,14 @@ private:
     bool rebuild_chunk();
     void process_events();
     void update(f32 dt);
+    void handle_inputs(f32 dt);
     void render();
 
     SDL_Window* m_window = nullptr;
     vulk::VulkanContext m_vulkan_context {};
     Camera m_camera {};
 
-    Chunk m_chunk {};
-    ChunkMesh m_chunk_mesh {};
+    std::unique_ptr<WorldManager> m_manager {};
 
     vulk::BufferHandle m_block_material_buffer {};
     vulk::ShaderHandle m_chunk_shader {};
