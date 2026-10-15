@@ -21,10 +21,12 @@ void ChunkGenerator::generate(Chunk& chunk)
                     block = BlockType::Grass;
                 else if (max_y - y > 4)
                     block = BlockType::Stone;
-                chunk.set_block(x, y, z, block);
+                chunk.set_block_unchecked(x, y, z, block);
             }
         }
     }
+
+    chunk.recalculate_portal_mask();
 }
 
 } // namespace vl

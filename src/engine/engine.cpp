@@ -136,6 +136,13 @@ bool Engine::rebuild_chunk()
         m_chunk_mesh.quad_count, m_chunk_mesh.vertices.size(), vram_kb, gen_us, mesh_us
     );
 
+    std::println("has portal Left:  {}", m_chunk.has_portal(Direction::Left));
+    std::println("has portal Right: {}", m_chunk.has_portal(Direction::Right));
+    std::println("has portal Up:    {}", m_chunk.has_portal(Direction::Up));
+    std::println("has portal Down:  {}", m_chunk.has_portal(Direction::Down));
+    std::println("has portal Back:  {}", m_chunk.has_portal(Direction::Back));
+    std::println("has portal Front: {}", m_chunk.has_portal(Direction::Front));
+
     return true;
 }
 
