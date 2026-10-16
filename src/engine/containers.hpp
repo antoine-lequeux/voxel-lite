@@ -200,6 +200,9 @@ public:
         m_meshes[slot].destroy_gpu_resources(ctx);
         m_meshes[slot].clear();
 
+        // Release the chunk heap memory to reduce RAM usage
+        m_chunks[slot].reset();
+
         // Dense active list removal
         const u32 last_idx = --m_active_count;
         if (active_idx != last_idx)
@@ -211,6 +214,16 @@ public:
 
         m_slot_to_active[slot] = INVALID_POOL_INDEX;
         m_free_slots[m_free_count++] = slot;
+    }
+
+    void trim()
+    {
+        for (u32 i = 0; i < m_free_count; ++i)
+        {
+            const u32 slot = m_free_slots[i];
+            if (m_chunks[slot]) m_chunks[slot].reset();
+            m_meshes[slot].clear();
+        }
     }
 
     [[nodiscard]] Chunk& chunk_at(u32 slot) { return *m_chunks[slot]; }

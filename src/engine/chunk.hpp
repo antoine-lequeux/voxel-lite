@@ -54,6 +54,7 @@ struct ChunkMesh
     void clear()
     {
         vertices.clear();
+        vertices.shrink_to_fit();
         quad_count = 0;
     }
 

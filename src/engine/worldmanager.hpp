@@ -5,6 +5,8 @@
 #include "engine/chunk.hpp"
 #include "renderer/vulkancontext.hpp"
 
+#include <mimalloc.h>
+
 #include <cmath>
 
 namespace vl
@@ -106,15 +108,21 @@ public:
         };
 
         // Unload chunks outside UNLOAD_DIST
+        u32 unloaded_count = 0;
         for (i32 i = static_cast<i32>(m_pool.size()) - 1; i >= 0; --i)
         {
             const u32 slot = m_pool.active_slot(static_cast<u32>(i));
             const glm::ivec3 c = m_pool.chunk_at(slot).coord;
-            if (std::abs(c.x - cam_pos.x) > UNLOAD_DIST || std::abs(c.z - cam_pos.z) > UNLOAD_DIST) unload_chunk(c, ctx);
+            if (std::abs(c.x - cam_pos.x) > UNLOAD_DIST || std::abs(c.z - cam_pos.z) > UNLOAD_DIST)
+            {
+                unload_chunk(c, ctx);
+                ++unloaded_count;
+            }
         }
 
         // Generate missing chunks radially outward in concentric square rings
         generate_missing_chunks_radially(cam_pos, 12);
+        if (unloaded_count > 0) mi_collect(true);
 
         // Mesh dirty chunks that are within LOAD_DIST and have all neighbors
         u32 mesh_budget = 12;
@@ -134,6 +142,8 @@ public:
                     ChunkMesh& mesh = m_pool.mesh_at(slot);
                     chunk.generate_mesh(mesh, neighbors);
                     mesh.upload_to_gpu(ctx);
+                    mesh.vertices.clear();
+                    mesh.vertices.shrink_to_fit();
                     chunk.mesh_dirty = false;
                     --mesh_budget;
                 }

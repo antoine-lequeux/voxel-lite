@@ -9,7 +9,7 @@
 namespace vl
 {
 
-using BlockID = u16;
+using BlockID = u8;
 
 enum class Direction : u8
 {
