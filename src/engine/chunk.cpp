@@ -214,6 +214,7 @@ BlockID Chunk::sample_block(i32 x, i32 y, i32 z, const ChunkNeighbors& neighbors
 void Chunk::generate_mesh(ChunkMesh& out_mesh, const ChunkNeighbors& neighbors) const
 {
     out_mesh.clear();
+    out_mesh.coord = coord;
 
     if (out_mesh.vertices.capacity() < 16384u) out_mesh.vertices.reserve(16384u);
 

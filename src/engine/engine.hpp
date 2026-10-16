@@ -15,7 +15,7 @@ namespace AppConfig
 {
 inline constexpr const char* NAME = "Voxel Lite";
 inline constexpr u32 VERSION_MAJOR = 0;
-inline constexpr u32 VERSION_MINOR = 1;
+inline constexpr u32 VERSION_MINOR = 2;
 inline constexpr u32 VERSION_PATCH = 0;
 } // namespace AppConfig
 
@@ -32,7 +32,6 @@ private:
     bool init_chunk_resources();
     bool rebuild_chunk();
     void process_events();
-    void update(f32 dt);
     void handle_inputs(f32 dt);
     void render();
 

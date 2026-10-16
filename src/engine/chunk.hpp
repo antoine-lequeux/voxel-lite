@@ -33,6 +33,7 @@ using PackedVertex = u32;
 
 struct ChunkMesh
 {
+    glm::ivec3 coord {0, 0, 0};
     std::vector<PackedVertex> vertices {};
     u32 quad_count = 0;
 
@@ -41,6 +42,14 @@ struct ChunkMesh
 
     [[nodiscard]] constexpr u32 index_count() const { return quad_count * 6u; }
     [[nodiscard]] constexpr bool empty() const { return quad_count == 0u; }
+    [[nodiscard]] constexpr glm::vec3 world_origin() const
+    {
+        return glm::vec3 {
+            static_cast<f32>(coord.x * CHUNK_SIZE),
+            static_cast<f32>(coord.y * CHUNK_SIZE),
+            static_cast<f32>(coord.z * CHUNK_SIZE),
+        };
+    }
 
     void clear()
     {

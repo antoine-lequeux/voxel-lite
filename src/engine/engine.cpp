@@ -170,15 +170,6 @@ void Engine::process_events()
     }
 }
 
-void Engine::update(f32 dt)
-{
-    m_elapsed_time += dt;
-
-    handle_inputs(dt);
-
-    m_manager->update(m_camera.position, m_vulkan_context);
-}
-
 void Engine::handle_inputs(f32 dt)
 {
     const bool* keys = SDL_GetKeyboardState(nullptr);
@@ -207,37 +198,46 @@ void Engine::handle_inputs(f32 dt)
 
 void Engine::render()
 {
-    if (!m_vulkan_context.begin_frame()) return;
-
     vulk::RenderPassInfo pass_info {};
     pass_info.clear_color = {0.47f, 0.65f, 1.0f, 1.0f}; // Sky color
     pass_info.clear_depth = 1.0f;
 
     m_vulkan_context.begin_rendering(pass_info);
 
-    for (const auto& [chunk, mesh] : m_manager->get_active_chunks())
+    // Bind graphics pipeline and quad index buffer once per frame
+    m_vulkan_context.bind_pipeline(m_chunk_pipeline);
+
+    const vulk::BufferHandle quad_ibo = m_vulkan_context.get_or_create_quad_index_buffer(16384);
+    if (quad_ibo.is_valid()) m_vulkan_context.bind_index_buffer_u32(quad_ibo);
+
+    const glm::mat4 vp = m_camera.view_projection_matrix(m_vulkan_context.get_aspect_ratio());
+    const Frustum frustum = Frustum::from_view_projection(vp);
+    const glm::vec4 cam_pos = glm::vec4 {m_camera.position, 1.0f};
+    const u64 material_addr = m_vulkan_context.get_buffer_device_address(m_block_material_buffer);
+
+    // Render active chunks
+    for (const auto& mesh : m_manager->get_active_meshes())
     {
-        if (!mesh.empty() && mesh.vertex_buffer.is_valid())
-        {
-            m_vulkan_context.bind_pipeline(m_chunk_pipeline);
+        if (mesh.empty() || !mesh.vertex_buffer.is_valid()) continue;
 
-            const vulk::BufferHandle quad_ibo = m_vulkan_context.get_or_create_quad_index_buffer(mesh.quad_count);
-            m_vulkan_context.bind_index_buffer_u32(quad_ibo);
+        const glm::vec3 origin = mesh.world_origin();
+        constexpr glm::vec3 chunk_dims {static_cast<f32>(CHUNK_SIZE)};
 
-            ChunkPushConstants pc {};
-            pc.mvp = m_camera.view_projection_matrix(m_vulkan_context.get_aspect_ratio());
-            pc.chunk_origin_and_time = glm::vec4 {chunk.world_origin(), m_elapsed_time};
-            pc.camera_pos = glm::vec4 {m_camera.position, 1.0f};
-            pc.vertex_buffer_address = m_vulkan_context.get_buffer_device_address(mesh.vertex_buffer);
-            pc.material_buffer_address = m_vulkan_context.get_buffer_device_address(m_block_material_buffer);
+        // Frustum culling
+        if (!frustum.intersects_aabb(origin, origin + chunk_dims)) continue;
 
-            m_vulkan_context.push_constants(pc);
-            m_vulkan_context.draw_indexed(mesh.index_count());
-        }
+        ChunkPushConstants pc {};
+        pc.mvp = vp;
+        pc.chunk_origin_and_time = glm::vec4 {origin, m_elapsed_time};
+        pc.camera_pos = cam_pos;
+        pc.vertex_buffer_address = m_vulkan_context.get_buffer_device_address(mesh.vertex_buffer);
+        pc.material_buffer_address = material_addr;
+
+        m_vulkan_context.push_constants(pc);
+        m_vulkan_context.draw_indexed(mesh.index_count());
     }
 
     m_vulkan_context.end_rendering();
-    m_vulkan_context.end_frame();
 }
 
 void Engine::run()
@@ -268,8 +268,16 @@ void Engine::run()
         }
 
         process_events();
-        update(dt);
+        handle_inputs(dt);
+        m_elapsed_time += dt;
+
+        if (!m_vulkan_context.begin_frame()) continue;
+
+        m_manager->update(m_camera.position, m_vulkan_context);
+        m_vulkan_context.memory_barrier_transfer_to_graphics();
+
         render();
+        m_vulkan_context.end_frame();
     }
 }
 
