@@ -181,8 +181,6 @@ void ChunkMesh::destroy_gpu_resources(vulk::VulkanContext& ctx)
 
 BlockID Chunk::sample_block(i32 x, i32 y, i32 z, const ChunkNeighbors& neighbors) const
 {
-    constexpr i32 size = static_cast<i32>(CHUNK_SIZE);
-
     // Inside current chunk
     if (static_cast<u32>(x) < CHUNK_SIZE && static_cast<u32>(y) < CHUNK_SIZE && static_cast<u32>(z) < CHUNK_SIZE)
         return get_block_unchecked(static_cast<u32>(x), static_cast<u32>(y), static_cast<u32>(z));
@@ -191,23 +189,23 @@ BlockID Chunk::sample_block(i32 x, i32 y, i32 z, const ChunkNeighbors& neighbors
     if (static_cast<u32>(y) < CHUNK_SIZE && static_cast<u32>(z) < CHUNK_SIZE)
     {
         if (x < 0 && neighbors.left != nullptr)
-            return neighbors.left->get_block(static_cast<u32>(x + size), static_cast<u32>(y), static_cast<u32>(z));
-        if (x >= size && neighbors.right != nullptr)
-            return neighbors.right->get_block(static_cast<u32>(x - size), static_cast<u32>(y), static_cast<u32>(z));
+            return neighbors.left->get_block(static_cast<u32>(x + CHUNK_SIZE), static_cast<u32>(y), static_cast<u32>(z));
+        if (x >= CHUNK_SIZE && neighbors.right != nullptr)
+            return neighbors.right->get_block(static_cast<u32>(x - CHUNK_SIZE), static_cast<u32>(y), static_cast<u32>(z));
     }
     if (static_cast<u32>(x) < CHUNK_SIZE && static_cast<u32>(z) < CHUNK_SIZE)
     {
         if (y < 0 && neighbors.down != nullptr)
-            return neighbors.down->get_block(static_cast<u32>(x), static_cast<u32>(y + size), static_cast<u32>(z));
-        if (y >= size && neighbors.up != nullptr)
-            return neighbors.up->get_block(static_cast<u32>(x), static_cast<u32>(y - size), static_cast<u32>(z));
+            return neighbors.down->get_block(static_cast<u32>(x), static_cast<u32>(y + CHUNK_SIZE), static_cast<u32>(z));
+        if (y >= CHUNK_SIZE && neighbors.up != nullptr)
+            return neighbors.up->get_block(static_cast<u32>(x), static_cast<u32>(y - CHUNK_SIZE), static_cast<u32>(z));
     }
     if (static_cast<u32>(x) < CHUNK_SIZE && static_cast<u32>(y) < CHUNK_SIZE)
     {
         if (z < 0 && neighbors.back != nullptr)
-            return neighbors.back->get_block(static_cast<u32>(x), static_cast<u32>(y), static_cast<u32>(z + size));
-        if (z >= size && neighbors.front != nullptr)
-            return neighbors.front->get_block(static_cast<u32>(x), static_cast<u32>(y), static_cast<u32>(z - size));
+            return neighbors.back->get_block(static_cast<u32>(x), static_cast<u32>(y), static_cast<u32>(z + CHUNK_SIZE));
+        if (z >= CHUNK_SIZE && neighbors.front != nullptr)
+            return neighbors.front->get_block(static_cast<u32>(x), static_cast<u32>(y), static_cast<u32>(z - CHUNK_SIZE));
     }
 
     return BlockType::Air;
