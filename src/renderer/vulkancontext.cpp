@@ -50,6 +50,10 @@
 #define VMA_IMPLEMENTATION
 #include <vk_mem_alloc.h>
 
+#include <imgui.h>
+#include <imgui_impl_sdl3.h>
+#include <imgui_impl_vulkan.h>
+
 #if defined(__clang__)
     #pragma clang diagnostic pop
 #elif defined(__GNUC__)
@@ -211,6 +215,9 @@ struct FrameData
 
     std::vector<GpuBuffer> pending_buffer_deletions;
     std::vector<GpuTexture> pending_texture_deletions;
+
+    VkQueryPool timestamp_query_pool = VK_NULL_HANDLE;
+    bool timestamp_query_active = false;
 };
 
 constexpr VkFormat to_vk_format(TextureFormat fmt)
@@ -401,6 +408,9 @@ struct VulkanContext::Impl
     u32 triangles_current_frame = 0;
     u32 draw_calls_last_frame = 0;
     u32 triangles_last_frame = 0;
+
+    f32 timestamp_period = 1.0f;
+    f32 gpu_render_time_ms = 0.0f;
 
     bool allocate_raw_buffer(u64 size_bytes, BufferUsage usage, MemoryUsage mem_usage, GpuBuffer& out_buf)
     {
@@ -863,6 +873,9 @@ bool VulkanContext::init(SDL_Window* window, const ContextConfig& config)
     m_impl->device = m_impl->vkb_device.device;
     volkLoadDevice(m_impl->device);
 
+    m_impl->timestamp_period = m_impl->vkb_physical_device.properties.limits.timestampPeriod;
+    if (m_impl->timestamp_period <= 0.0f) m_impl->timestamp_period = 1.0f;
+
     auto queue_ret = m_impl->vkb_device.get_queue(vkb::QueueType::graphics);
     auto queue_fam_ret = m_impl->vkb_device.get_queue_index(vkb::QueueType::graphics);
     if (!queue_ret || !queue_fam_ret)
@@ -965,6 +978,13 @@ bool VulkanContext::init(SDL_Window* window, const ContextConfig& config)
             return false;
         }
 
+        VkQueryPoolCreateInfo query_pool_info {};
+        query_pool_info.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+        query_pool_info.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        query_pool_info.queryCount = 2;
+        if (vkCreateQueryPool(m_impl->device, &query_pool_info, nullptr, &frame.timestamp_query_pool) != VK_SUCCESS)
+            frame.timestamp_query_pool = VK_NULL_HANDLE;
+
         if (config.staging_buffer_size > 0)
         {
             const u64 per_frame_staging = std::max<u64>(4ull * 1024ull * 1024ull, config.staging_buffer_size / frame_count);
@@ -998,6 +1018,8 @@ bool VulkanContext::init(SDL_Window* window, const ContextConfig& config)
 void VulkanContext::shutdown()
 {
     if (m_impl == nullptr) return;
+
+    shutdown_imgui();
 
     if (m_impl->device != VK_NULL_HANDLE) vkDeviceWaitIdle(m_impl->device);
 
@@ -1034,6 +1056,12 @@ void VulkanContext::shutdown()
     {
         m_impl->flush_frame_deletions(frame);
         m_impl->destroy_raw_buffer(frame.staging_buffer);
+
+        if (frame.timestamp_query_pool != VK_NULL_HANDLE)
+        {
+            vkDestroyQueryPool(m_impl->device, frame.timestamp_query_pool, nullptr);
+            frame.timestamp_query_pool = VK_NULL_HANDLE;
+        }
 
         if (frame.image_available_semaphore != VK_NULL_HANDLE)
             vkDestroySemaphore(m_impl->device, frame.image_available_semaphore, nullptr);
@@ -1114,6 +1142,11 @@ void VulkanContext::set_vsync(bool enabled)
     }
 }
 
+bool VulkanContext::is_vsync_enabled() const
+{
+    return (m_impl != nullptr) ? m_impl->config.vsync : false;
+}
+
 u32 VulkanContext::get_render_width() const
 {
     return (m_impl != nullptr) ? m_impl->render_width : 0;
@@ -1162,6 +1195,103 @@ GpuMemoryStats VulkanContext::get_memory_stats() const
     return stats;
 }
 
+std::string_view VulkanContext::get_gpu_name() const
+{
+    if (m_impl == nullptr) return "";
+    return m_impl->vkb_physical_device.properties.deviceName;
+}
+
+f32 VulkanContext::get_gpu_render_time_ms() const
+{
+    return (m_impl != nullptr) ? m_impl->gpu_render_time_ms : 0.0f;
+}
+
+bool VulkanContext::init_imgui(SDL_Window* window)
+{
+    if (m_impl == nullptr || !m_impl->initialized || window == nullptr) return false;
+
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGuiIO& io = ImGui::GetIO();
+    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+    io.IniFilename = nullptr; // Do not create imgui.ini
+
+    ImGui::StyleColorsDark();
+    ImGuiStyle& style = ImGui::GetStyle();
+    style.WindowRounding = 6.0f;
+    style.FrameRounding = 4.0f;
+    style.PopupRounding = 4.0f;
+    style.ScrollbarRounding = 4.0f;
+    style.GrabRounding = 4.0f;
+    style.WindowBorderSize = 1.0f;
+    style.FrameBorderSize = 0.0f;
+    style.Colors[ImGuiCol_WindowBg] = ImVec4(0.08f, 0.09f, 0.12f, 0.85f);
+    style.Colors[ImGuiCol_Border] = ImVec4(0.25f, 0.32f, 0.45f, 0.65f);
+
+    if (!ImGui_ImplSDL3_InitForVulkan(window))
+    {
+        std::println(stderr, "[VulkanContext] Failed to initialize ImGui SDL3 backend");
+        return false;
+    }
+
+    ImGui_ImplVulkan_InitInfo init_info {};
+    init_info.ApiVersion = VK_API_VERSION_1_3;
+    init_info.Instance = m_impl->vkb_instance.instance;
+    init_info.PhysicalDevice = m_impl->vkb_physical_device.physical_device;
+    init_info.Device = m_impl->device;
+    init_info.QueueFamily = m_impl->graphics_queue_family;
+    init_info.Queue = m_impl->graphics_queue;
+    init_info.DescriptorPoolSize = 64;
+    init_info.MinImageCount = 2;
+    init_info.ImageCount = static_cast<u32>(m_impl->frames.size());
+    init_info.UseDynamicRendering = true;
+
+    init_info.PipelineInfoMain.PipelineRenderingCreateInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO_KHR;
+    init_info.PipelineInfoMain.PipelineRenderingCreateInfo.colorAttachmentCount = 1;
+    init_info.PipelineInfoMain.PipelineRenderingCreateInfo.pColorAttachmentFormats = &m_impl->swapchain_format;
+    init_info.PipelineInfoMain.PipelineRenderingCreateInfo.depthAttachmentFormat = m_impl->depth_format;
+
+    if (!ImGui_ImplVulkan_Init(&init_info))
+    {
+        std::println(stderr, "[VulkanContext] Failed to initialize ImGui Vulkan backend");
+        ImGui_ImplSDL3_Shutdown();
+        ImGui::DestroyContext();
+        return false;
+    }
+
+    return true;
+}
+
+void VulkanContext::shutdown_imgui()
+{
+    if (ImGui::GetCurrentContext() != nullptr)
+    {
+        wait_idle();
+        ImGui_ImplVulkan_Shutdown();
+        ImGui_ImplSDL3_Shutdown();
+        ImGui::DestroyContext();
+    }
+}
+
+void VulkanContext::begin_imgui_frame()
+{
+    ImGui_ImplVulkan_NewFrame();
+    ImGui_ImplSDL3_NewFrame();
+    ImGui::NewFrame();
+}
+
+void VulkanContext::end_imgui_frame()
+{
+    ImGui::Render();
+}
+
+void VulkanContext::render_imgui()
+{
+    if (m_impl == nullptr || !m_impl->rendering_active) return;
+    ImDrawData* draw_data = ImGui::GetDrawData();
+    if (draw_data != nullptr) ImGui_ImplVulkan_RenderDrawData(draw_data, m_impl->frames[m_impl->current_frame_index].cmd);
+}
+
 bool VulkanContext::begin_frame()
 {
     if (m_impl == nullptr || !m_impl->initialized || m_impl->headless) return false;
@@ -1182,6 +1312,24 @@ bool VulkanContext::begin_frame()
     FrameData& frame = m_impl->frames[m_impl->current_frame_index];
 
     if (vkWaitForFences(m_impl->device, 1, &frame.in_flight_fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS) return false;
+
+    if (frame.timestamp_query_pool != VK_NULL_HANDLE && frame.timestamp_query_active)
+    {
+        u64 timestamps[2] = {0, 0};
+        const VkResult res = vkGetQueryPoolResults(
+            m_impl->device, frame.timestamp_query_pool, 0, 2, sizeof(timestamps), timestamps, sizeof(u64), VK_QUERY_RESULT_64_BIT
+        );
+        if (res == VK_SUCCESS && timestamps[1] >= timestamps[0])
+        {
+            const f64 duration_ns = static_cast<f64>(timestamps[1] - timestamps[0]) * static_cast<f64>(m_impl->timestamp_period);
+            const f32 ms = static_cast<f32>(duration_ns * 1e-6);
+            if (m_impl->gpu_render_time_ms <= 0.001f)
+                m_impl->gpu_render_time_ms = ms;
+            else
+                m_impl->gpu_render_time_ms = m_impl->gpu_render_time_ms * 0.85f + ms * 0.15f;
+        }
+        frame.timestamp_query_active = false;
+    }
 
     const VkResult acquire_res = vkAcquireNextImageKHR(
         m_impl->device, m_impl->vkb_swapchain.swapchain, UINT64_MAX, frame.image_available_semaphore, VK_NULL_HANDLE,
@@ -1276,8 +1424,17 @@ void VulkanContext::begin_rendering(const RenderPassInfo& pass_info)
     render_info.pColorAttachments = &color_attachment;
     render_info.pDepthAttachment = &depth_attachment;
 
+    FrameData& frame = m_impl->frames[m_impl->current_frame_index];
+    if (frame.timestamp_query_pool != VK_NULL_HANDLE) vkCmdResetQueryPool(cmd, frame.timestamp_query_pool, 0, 2);
+
     vkCmdBeginRendering(cmd, &render_info);
     m_impl->rendering_active = true;
+
+    if (frame.timestamp_query_pool != VK_NULL_HANDLE)
+    {
+        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, frame.timestamp_query_pool, 0);
+        frame.timestamp_query_active = true;
+    }
 
     set_viewport(0.0f, 0.0f, static_cast<f32>(m_impl->render_width), static_cast<f32>(m_impl->render_height), 0.0f, 1.0f);
     set_scissor(0, 0, m_impl->render_width, m_impl->render_height);
@@ -1287,7 +1444,11 @@ void VulkanContext::end_rendering()
 {
     if (m_impl == nullptr || !m_impl->rendering_active) return;
 
-    VkCommandBuffer cmd = m_impl->frames[m_impl->current_frame_index].cmd;
+    FrameData& frame = m_impl->frames[m_impl->current_frame_index];
+    VkCommandBuffer cmd = frame.cmd;
+    if (frame.timestamp_query_pool != VK_NULL_HANDLE && frame.timestamp_query_active)
+        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, frame.timestamp_query_pool, 1);
+
     vkCmdEndRendering(cmd);
     m_impl->rendering_active = false;
 
@@ -1936,5 +2097,24 @@ void VulkanContext::dispatch_compute_indirect(BufferHandle indirect_buffer, u64 
     vkCmdDispatchIndirect(m_impl->frames[m_impl->current_frame_index].cmd, ind_buf->buffer, offset_bytes);
 }
 
+void VulkanContext::memory_barrier_transfer_to_graphics()
+{
+    if (m_impl == nullptr || !m_impl->frame_active) return;
+
+    VkMemoryBarrier2 barrier {};
+    barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+    barrier.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+    barrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    barrier.dstStageMask =
+        VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_2_INDEX_INPUT_BIT | VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT;
+    barrier.dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_INDEX_READ_BIT | VK_ACCESS_2_VERTEX_ATTRIBUTE_READ_BIT |
+                            VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT;
+
+    VkDependencyInfo dep {};
+    dep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    dep.memoryBarrierCount = 1;
+    dep.pMemoryBarriers = &barrier;
+    vkCmdPipelineBarrier2(m_impl->frames[m_impl->current_frame_index].cmd, &dep);
+}
 
 } // namespace vulk

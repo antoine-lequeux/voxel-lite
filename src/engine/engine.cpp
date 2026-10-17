@@ -5,6 +5,8 @@
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_scancode.h>
 #include <glm/glm.hpp>
+#include <imgui.h>
+#include <imgui_impl_sdl3.h>
 
 #include <array>
 #include <format>
@@ -79,6 +81,12 @@ bool Engine::init()
         return false;
     }
 
+    if (!m_vulkan_context.init_imgui(m_window))
+    {
+        std::println(stderr, "[Engine] Failed to initialize ImGui");
+        return false;
+    }
+
     m_manager = std::make_unique<WorldManager>();
 
     m_running = true;
@@ -121,6 +129,10 @@ void Engine::process_events()
     SDL_Event event {};
     while (SDL_PollEvent(&event))
     {
+        ImGui_ImplSDL3_ProcessEvent(&event);
+
+        const ImGuiIO& io = ImGui::GetIO();
+
         switch (event.type)
         {
             case SDL_EVENT_QUIT:
@@ -148,7 +160,7 @@ void Engine::process_events()
             case SDL_EVENT_MOUSE_BUTTON_DOWN:
                 if (event.button.button == SDL_BUTTON_LEFT || event.button.button == SDL_BUTTON_RIGHT)
                 {
-                    if (!m_mouse_captured)
+                    if (!m_mouse_captured && !io.WantCaptureMouse)
                     {
                         m_mouse_captured = true;
                         SDL_SetWindowRelativeMouseMode(m_window, true);
@@ -157,7 +169,7 @@ void Engine::process_events()
                 break;
 
             case SDL_EVENT_MOUSE_MOTION:
-                if (m_mouse_captured || (event.motion.state & SDL_BUTTON_RMASK) != 0)
+                if (m_mouse_captured)
                 {
                     m_camera.rotate(
                         event.motion.xrel * m_camera.mouse_sensitivity, -event.motion.yrel * m_camera.mouse_sensitivity
@@ -210,10 +222,15 @@ void Engine::render()
     const vulk::BufferHandle quad_ibo = m_vulkan_context.get_or_create_quad_index_buffer(16384);
     if (quad_ibo.is_valid()) m_vulkan_context.bind_index_buffer_u32(quad_ibo);
 
+    m_camera.update_far_plane(m_manager->get_render_distance(), CHUNK_SIZE);
+
     const glm::mat4 vp = m_camera.view_projection_matrix(m_vulkan_context.get_aspect_ratio());
     const Frustum frustum = Frustum::from_view_projection(vp);
     const glm::vec4 cam_pos = glm::vec4 {m_camera.position, 1.0f};
     const u64 material_addr = m_vulkan_context.get_buffer_device_address(m_block_material_buffer);
+
+    u32 chunks_drawn = 0;
+    u32 chunks_culled = 0;
 
     // Render active chunks
     for (const auto& mesh : m_manager->get_active_meshes())
@@ -224,7 +241,11 @@ void Engine::render()
         constexpr glm::vec3 chunk_dims {static_cast<f32>(CHUNK_SIZE)};
 
         // Frustum culling
-        if (!frustum.intersects_aabb(origin, origin + chunk_dims)) continue;
+        if (m_overlay.frustum_culling_enabled && !frustum.intersects_aabb(origin, origin + chunk_dims))
+        {
+            ++chunks_culled;
+            continue;
+        }
 
         ChunkPushConstants pc {};
         pc.mvp = vp;
@@ -235,7 +256,13 @@ void Engine::render()
 
         m_vulkan_context.push_constants(pc);
         m_vulkan_context.draw_indexed(mesh.index_count());
+        ++chunks_drawn;
     }
+
+    m_overlay.set_chunk_culling_stats(chunks_drawn, chunks_culled);
+
+    // Render ImGui overlay on top of 3D geometry
+    m_vulkan_context.render_imgui();
 
     m_vulkan_context.end_rendering();
 }
@@ -245,39 +272,42 @@ void Engine::run()
     std::println("[Engine] Entering main loop...");
 
     u64 last_counter = SDL_GetPerformanceCounter();
-    const f32 perf_freq = static_cast<f32>(SDL_GetPerformanceFrequency());
-    f32 fps_timer = 0.0f;
-    u32 frame_count = 0;
+    const f64 perf_freq = static_cast<f64>(SDL_GetPerformanceFrequency());
+    f32 last_cpu_work_ms = 0.0f;
 
     while (m_running)
     {
         const u64 now_counter = SDL_GetPerformanceCounter();
-        const f32 dt = std::min(0.1f, static_cast<f32>(now_counter - last_counter) / perf_freq);
+        const f32 dt = std::min(0.1f, static_cast<f32>(static_cast<f64>(now_counter - last_counter) / perf_freq));
         last_counter = now_counter;
-        fps_timer += dt;
-        frame_count++;
 
-        if (fps_timer >= 1.0f)
-        {
-            std::println(
-                "fps: {:.2f} ({:.2f} ms)", static_cast<f32>(frame_count) / fps_timer,
-                (fps_timer * 1000.0f) / static_cast<f32>(frame_count)
-            );
-            fps_timer = 0.0f;
-            frame_count = 0;
-        }
+        u64 cpu_work_ticks = 0;
+        const u64 t0 = SDL_GetPerformanceCounter();
 
         process_events();
         handle_inputs(dt);
         m_elapsed_time += dt;
 
+        // Update debug overlay and construct ImGui draw lists
+        m_overlay.update(dt, last_cpu_work_ms);
+        m_vulkan_context.begin_imgui_frame();
+        m_overlay.draw(dt, *m_manager, m_camera, m_vulkan_context);
+        m_vulkan_context.end_imgui_frame();
+
+        cpu_work_ticks += (SDL_GetPerformanceCounter() - t0);
+
         if (!m_vulkan_context.begin_frame()) continue;
+
+        const u64 t1 = SDL_GetPerformanceCounter();
 
         m_manager->update(m_camera.position, m_vulkan_context);
         m_vulkan_context.memory_barrier_transfer_to_graphics();
 
         render();
         m_vulkan_context.end_frame();
+
+        cpu_work_ticks += (SDL_GetPerformanceCounter() - t1);
+        last_cpu_work_ms = static_cast<f32>(static_cast<f64>(cpu_work_ticks) * 1000.0 / perf_freq);
     }
 }
 
@@ -286,6 +316,7 @@ void Engine::shutdown()
     std::println("[Engine] Shutting engine down...");
 
     m_vulkan_context.wait_idle();
+    m_vulkan_context.shutdown_imgui();
 
     for (const auto& [_, mesh] : m_manager->get_active_chunks()) mesh.destroy_gpu_resources(m_vulkan_context);
 

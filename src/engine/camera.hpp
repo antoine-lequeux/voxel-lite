@@ -22,8 +22,14 @@ public:
     f32 near_plane = 0.05f;
     f32 far_plane = 1000.0f;
 
-    f32 move_speed = 5.5f;
-    f32 sprint_multiplier = 25.0f;
+    void update_far_plane(i32 render_distance, i32 chunk_size)
+    {
+        const f32 needed = static_cast<f32>(render_distance + 2) * static_cast<f32>(chunk_size) * 1.45f + 64.0f;
+        far_plane = std::max(1000.0f, needed);
+    }
+
+    f32 move_speed = 10.0f;
+    f32 sprint_multiplier = 15.0f;
     f32 mouse_sensitivity = 0.12f;
 
     [[nodiscard]] glm::vec3 forward() const

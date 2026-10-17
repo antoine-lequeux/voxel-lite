@@ -1,6 +1,7 @@
 #pragma once
 
 #include "engine/camera.hpp"
+#include "engine/overlay.hpp"
 #include "engine/worldmanager.hpp"
 #include "renderer/vulkancontext.hpp"
 
@@ -48,6 +49,8 @@ private:
     f32 m_elapsed_time = 0.0f;
     bool m_running = false;
     bool m_mouse_captured = false;
+
+    DebugOverlay m_overlay {};
 };
 
 } // namespace vl

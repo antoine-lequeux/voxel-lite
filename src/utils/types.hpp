@@ -3,8 +3,14 @@
 #include <cstddef>
 #include <cstdint>
 
-#define NOMINMAX
-#define WIN32_LEAN_AND_MEAN
+#if defined(_WIN32)
+    #ifndef NOMINMAX
+        #define NOMINMAX
+    #endif
+    #ifndef WIN32_LEAN_AND_MEAN
+        #define WIN32_LEAN_AND_MEAN
+    #endif
+#endif
 
 using u8 = std::uint8_t;
 using u16 = std::uint16_t;

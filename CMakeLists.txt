@@ -208,6 +208,10 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     Vulkan::Headers
 )
 
+if(WIN32)
+    target_link_libraries(${PROJECT_NAME} PRIVATE psapi)
+endif()
+
 # ---------------------------------------------------------
 # Compiler flags & options
 # ---------------------------------------------------------

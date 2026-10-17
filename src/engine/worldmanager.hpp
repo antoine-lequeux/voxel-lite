@@ -7,21 +7,31 @@
 
 #include <mimalloc.h>
 
+#include <algorithm>
 #include <cmath>
 
 namespace vl
 {
 
-constexpr i32 RENDER_DIST = 32;
-constexpr i32 LOAD_DIST = RENDER_DIST + 1;
-constexpr i32 UNLOAD_DIST = RENDER_DIST + 2;
+constexpr u32 MAX_ACTIVE_CHUNKS = 32768;
+constexpr u32 HASH_MAP_CAPACITY = MAX_ACTIVE_CHUNKS * 2;
+
+constexpr i32 MIN_RENDER_DIST = 2;
+constexpr i32 MAX_RENDER_DIST = 64;
+constexpr i32 DEFAULT_RENDER_DIST = 24;
+
+constexpr i32 CHUNKS_LOADED_PER_FRAME = 16;
+constexpr i32 CHUNKS_MESHED_PER_FRAME = 16;
 
 class WorldManager
 {
 public:
 
-    static constexpr u32 MAX_ACTIVE_CHUNKS = 32768;
-    static constexpr u32 HASH_MAP_CAPACITY = MAX_ACTIVE_CHUNKS * 2;
+    [[nodiscard]] i32 get_render_distance() const { return m_render_distance; }
+    void set_render_distance(i32 rd) { m_render_distance = std::clamp(rd, MIN_RENDER_DIST, MAX_RENDER_DIST); }
+
+    [[nodiscard]] u32 get_active_chunks_count() const { return m_pool.size(); }
+    [[nodiscard]] static constexpr u32 get_max_chunks_capacity() { return MAX_ACTIVE_CHUNKS; }
 
     [[nodiscard]] auto get_active_chunks() { return m_pool.zipped(); }
     [[nodiscard]] auto get_active_chunks() const { return m_pool.zipped(); }
@@ -101,31 +111,36 @@ public:
 
     void update(const glm::vec3& cam_world_pos, vulk::VulkanContext& ctx)
     {
+        const i32 rd = m_render_distance;
+        const i32 load_dist = rd + 1;
+        const i32 unload_dist = rd + 2;
+
         const glm::ivec3 cam_pos {
             static_cast<i32>(std::floor(cam_world_pos.x / static_cast<f32>(CHUNK_SIZE))),
             static_cast<i32>(std::floor(cam_world_pos.y / static_cast<f32>(CHUNK_SIZE))),
             static_cast<i32>(std::floor(cam_world_pos.z / static_cast<f32>(CHUNK_SIZE))),
         };
 
-        // Unload chunks outside UNLOAD_DIST
+        // Unload chunks outside unload_dist
         u32 unloaded_count = 0;
         for (i32 i = static_cast<i32>(m_pool.size()) - 1; i >= 0; --i)
         {
             const u32 slot = m_pool.active_slot(static_cast<u32>(i));
             const glm::ivec3 c = m_pool.chunk_at(slot).coord;
-            if (std::abs(c.x - cam_pos.x) > UNLOAD_DIST || std::abs(c.z - cam_pos.z) > UNLOAD_DIST)
+            if (std::abs(c.x - cam_pos.x) > unload_dist || std::abs(c.z - cam_pos.z) > unload_dist)
             {
                 unload_chunk(c, ctx);
                 ++unloaded_count;
             }
         }
 
-        // Generate missing chunks radially outward in concentric square rings
-        generate_missing_chunks_radially(cam_pos, 12);
         if (unloaded_count > 0) mi_collect(true);
 
-        // Mesh dirty chunks that are within LOAD_DIST and have all neighbors
-        u32 mesh_budget = 12;
+        // Generate missing chunks radially outward in concentric square rings up to load_dist
+        generate_missing_chunks_radially(cam_pos, load_dist, CHUNKS_LOADED_PER_FRAME);
+
+        // Mesh dirty chunks that are within load_dist and have all neighbors
+        u32 mesh_budget = CHUNKS_MESHED_PER_FRAME;
         const u32 total_active = m_pool.size();
 
         for (u32 i = 0; i < total_active && mesh_budget > 0u; ++i)
@@ -134,7 +149,7 @@ public:
             Chunk& chunk = m_pool.chunk_at(slot);
             if (!chunk.mesh_dirty) continue;
 
-            if (std::abs(chunk.coord.x - cam_pos.x) <= LOAD_DIST && std::abs(chunk.coord.z - cam_pos.z) <= LOAD_DIST)
+            if (std::abs(chunk.coord.x - cam_pos.x) <= load_dist && std::abs(chunk.coord.z - cam_pos.z) <= load_dist)
             {
                 const ChunkNeighbors neighbors = get_neighbors(chunk.coord);
                 if (neighbors.left && neighbors.right && neighbors.back && neighbors.front)
@@ -153,7 +168,7 @@ public:
 
 private:
 
-    void generate_missing_chunks_radially(const glm::ivec3& cam_pos, u32 max_chunks_to_gen)
+    void generate_missing_chunks_radially(const glm::ivec3& cam_pos, i32 max_radius, u32 max_chunks_to_gen)
     {
         u32 gen_budget = max_chunks_to_gen;
 
@@ -166,7 +181,7 @@ private:
         }
 
         // Concentric square rings outward
-        for (i32 r = 1; r <= LOAD_DIST; ++r)
+        for (i32 r = 1; r <= max_radius; ++r)
         {
             for (i32 dx = -r; dx <= r; ++dx)
             {
@@ -224,6 +239,7 @@ private:
 
     FlatSpatialMap<HASH_MAP_CAPACITY> m_map {};
     ChunkPool<MAX_ACTIVE_CHUNKS> m_pool {};
+    i32 m_render_distance = DEFAULT_RENDER_DIST;
 };
 
 } // namespace vl

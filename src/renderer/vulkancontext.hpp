@@ -267,12 +267,22 @@ public:
 
     bool on_resize(u32 width, u32 height);
     void set_vsync(bool enabled);
+    [[nodiscard]] bool is_vsync_enabled() const;
 
     [[nodiscard]] u32 get_render_width() const;
     [[nodiscard]] u32 get_render_height() const;
     [[nodiscard]] f32 get_aspect_ratio() const;
     [[nodiscard]] u32 get_current_frame_index() const;
     [[nodiscard]] GpuMemoryStats get_memory_stats() const;
+    [[nodiscard]] std::string_view get_gpu_name() const;
+    [[nodiscard]] f32 get_gpu_render_time_ms() const;
+
+    // ImGui integration
+    bool init_imgui(SDL_Window* window);
+    void shutdown_imgui();
+    void begin_imgui_frame();
+    void end_imgui_frame();
+    void render_imgui();
 
     // Frame and dynamic rendering lifecycle
     bool begin_frame();
