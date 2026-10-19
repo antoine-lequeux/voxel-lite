@@ -104,6 +104,7 @@ FetchContent_Declare(volk           GIT_REPOSITORY https://github.com/zeux/volk.
 FetchContent_Declare(vma            GIT_REPOSITORY https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator.git GIT_TAG v3.4.0               SYSTEM)
 FetchContent_Declare(vkbootstrap    GIT_REPOSITORY https://github.com/charles-lunarg/vk-bootstrap.git                    GIT_TAG v1.4.363             SYSTEM)
 FetchContent_Declare(mimalloc       GIT_REPOSITORY https://github.com/microsoft/mimalloc.git                             GIT_TAG v3.5.4               SYSTEM)
+FetchContent_Declare(FastNoise2     GIT_REPOSITORY https://github.com/Auburn/FastNoise2.git                              GIT_TAG v1.1.1               SYSTEM)
 
 # Silence warnings during third-party library compilation
 set(BACKUP_C_FLAGS "${CMAKE_C_FLAGS}")
@@ -116,7 +117,7 @@ else()
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -w")
 endif()
 
-FetchContent_MakeAvailable(vulkan_headers sdl3 enkits imgui glm volk vma vkbootstrap mimalloc)
+FetchContent_MakeAvailable(vulkan_headers sdl3 enkits imgui glm volk vma vkbootstrap mimalloc FastNoise2)
 
 target_link_libraries(volk PRIVATE Vulkan::Headers)
 target_link_libraries(volk_headers INTERFACE Vulkan::Headers)
@@ -206,6 +207,7 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     volk::volk
     vk-bootstrap
     Vulkan::Headers
+    FastNoise
 )
 
 if(WIN32)

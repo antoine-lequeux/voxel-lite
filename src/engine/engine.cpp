@@ -87,7 +87,7 @@ bool Engine::init()
         return false;
     }
 
-    m_manager = std::make_unique<WorldManager>();
+    m_manager = std::make_unique<WorldManager>(12345);
 
     m_running = true;
     return true;

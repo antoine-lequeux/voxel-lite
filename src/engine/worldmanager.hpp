@@ -27,6 +27,8 @@ class WorldManager
 {
 public:
 
+    explicit WorldManager(i32 seed) : m_generator(seed) {}
+
     [[nodiscard]] i32 get_render_distance() const { return m_render_distance; }
     void set_render_distance(i32 rd) { m_render_distance = std::clamp(rd, MIN_RENDER_DIST, MAX_RENDER_DIST); }
 
@@ -224,7 +226,7 @@ private:
         m_map.insert_or_assign(coord, idx);
 
         Chunk& new_chunk = m_pool.chunk_at(idx);
-        ChunkGenerator::generate(new_chunk);
+        m_generator.generate(new_chunk);
 
         mark_dirty(coord + glm::ivec3(-1, 0, 0));
         mark_dirty(coord + glm::ivec3(1, 0, 0));
@@ -240,6 +242,7 @@ private:
     FlatSpatialMap<HASH_MAP_CAPACITY> m_map {};
     ChunkPool<MAX_ACTIVE_CHUNKS> m_pool {};
     i32 m_render_distance = DEFAULT_RENDER_DIST;
+    ChunkGenerator m_generator {};
 };
 
 } // namespace vl
