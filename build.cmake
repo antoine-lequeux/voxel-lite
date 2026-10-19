@@ -48,24 +48,26 @@ endif()
 set(EXE "${BUILD_DIR}/${TARGET_NAME}${EXE_SUFFIX}")
 
 # Build
-message(STATUS "==> Config: [${COMP} | ${ARCH} | ${CONFIG}]...")
+if(NOT EXISTS "${BUILD_DIR}/CMakeCache.txt")
+    message(STATUS "==> Config: [${COMP} | ${ARCH} | ${CONFIG}]...")
 
-if(COMP STREQUAL "msvc")
-    execute_process(
-        COMMAND ${CMAKE_COMMAND} -B ${BUILD_DIR}
-            -DCMAKE_BUILD_TYPE=${CONFIG}
-            -DARCH=${ARCH}
-        COMMAND_ERROR_IS_FATAL ANY
-    )
-else()
-    execute_process(
-        COMMAND ${CMAKE_COMMAND} -B ${BUILD_DIR} ${GEN_ARGS}
-            -DCMAKE_BUILD_TYPE=${CONFIG}
-            -DCMAKE_CXX_COMPILER=${CXX_BIN}
-            -DCMAKE_C_COMPILER=${C_BIN}
-            -DARCH=${ARCH}
-        COMMAND_ERROR_IS_FATAL ANY
-    )
+    if(COMP STREQUAL "msvc")
+        execute_process(
+            COMMAND ${CMAKE_COMMAND} -B ${BUILD_DIR}
+                -DCMAKE_BUILD_TYPE=${CONFIG}
+                -DARCH=${ARCH}
+            COMMAND_ERROR_IS_FATAL ANY
+        )
+    else()
+        execute_process(
+            COMMAND ${CMAKE_COMMAND} -B ${BUILD_DIR} ${GEN_ARGS}
+                -DCMAKE_BUILD_TYPE=${CONFIG}
+                -DCMAKE_CXX_COMPILER=${CXX_BIN}
+                -DCMAKE_C_COMPILER=${C_BIN}
+                -DARCH=${ARCH}
+            COMMAND_ERROR_IS_FATAL ANY
+        )
+    endif()
 endif()
 
 if(EXISTS "${BUILD_DIR}/compile_commands.json")
