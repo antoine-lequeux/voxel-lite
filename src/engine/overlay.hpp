@@ -1,16 +1,9 @@
 #pragma once
 
 #include "engine/camera.hpp"
-#include "engine/chunk.hpp"
 #include "engine/worldmanager.hpp"
-#include "renderer/vulkancontext.hpp"
 
 #include <imgui.h>
-
-#include <functional>
-#include <string>
-#include <string_view>
-#include <vector>
 
 #if defined(_WIN32)
     #ifndef NOMINMAX
@@ -339,6 +332,9 @@ private:
 
             ImGui::Text("Chunks: %u drawn | %u culled", ctx.chunks_drawn, ctx.chunks_culled);
             ImGui::TextDisabled("Loaded: %u / %u", loaded_chunks, max_chunks);
+            ImGui::TextDisabled(
+                "Air: %u | Pending gen: %u", ctx.world.get_air_chunks_count(), ctx.world.get_pending_generation_count()
+            );
             ImGui::TextDisabled("Far Plane: %.0f m", static_cast<f64>(ctx.camera.far_plane));
             ImGui::TextDisabled(
                 "Position: (%.1f, %.1f, %.1f)", static_cast<f64>(ctx.camera.position.x), static_cast<f64>(ctx.camera.position.y),

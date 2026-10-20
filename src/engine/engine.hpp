@@ -1,11 +1,7 @@
 #pragma once
 
-#include "engine/camera.hpp"
 #include "engine/overlay.hpp"
 #include "engine/worldmanager.hpp"
-#include "renderer/vulkancontext.hpp"
-
-#include <memory>
 
 struct SDL_Window;
 
@@ -16,7 +12,7 @@ namespace AppConfig
 {
 inline constexpr const char* NAME = "Voxel Lite";
 inline constexpr u32 VERSION_MAJOR = 0;
-inline constexpr u32 VERSION_MINOR = 2;
+inline constexpr u32 VERSION_MINOR = 3;
 inline constexpr u32 VERSION_PATCH = 0;
 } // namespace AppConfig
 

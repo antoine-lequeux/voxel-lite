@@ -3,12 +3,7 @@
 #include "chunk.hpp"
 
 #include <bit>
-#include <cassert>
-#include <limits>
 #include <memory>
-#include <vector>
-
-#include <glm/glm.hpp>
 
 namespace vl
 {

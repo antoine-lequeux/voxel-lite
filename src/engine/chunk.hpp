@@ -3,11 +3,6 @@
 #include "engine/block.hpp"
 #include "renderer/vulkancontext.hpp"
 
-#include <array>
-#include <vector>
-
-#include <glm/glm.hpp>
-
 namespace vl
 {
 

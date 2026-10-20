@@ -1,16 +1,11 @@
 #include "engine.hpp"
 
-#include "engine/worldmanager.hpp"
-
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_scancode.h>
 #include <glm/glm.hpp>
 #include <imgui.h>
 #include <imgui_impl_sdl3.h>
 
-#include <array>
-#include <format>
-#include <memory>
 #include <print>
 
 namespace vl
@@ -103,7 +98,7 @@ bool Engine::init_chunk_resources()
     );
     if (!m_block_material_buffer.is_valid()) return false;
 
-    m_chunk_shader = m_vulkan_context.create_shader_from_file("chunk.spirv");
+    m_chunk_shader = m_vulkan_context.create_shader_from_file("shaders/chunk.spirv");
     if (!m_chunk_shader.is_valid()) return false;
 
     vulk::GraphicsPipelineDesc pipe_desc {};

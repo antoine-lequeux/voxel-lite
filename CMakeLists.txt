@@ -172,6 +172,7 @@ add_executable(${PROJECT_NAME}
     src/engine/chunk.cpp
     src/engine/chunkgenerator.cpp
     src/engine/engine.cpp
+    src/engine/worldmanager.cpp
     src/renderer/vulkancontext.cpp
 )
 
@@ -218,7 +219,8 @@ endif()
 # Compiler flags & options
 # ---------------------------------------------------------
 if(ARCH_FLAGS)
-    target_compile_options(${PROJECT_NAME} PRIVATE ${ARCH_FLAGS})
+    add_compile_options(${ARCH_FLAGS})
+    add_link_options(${ARCH_FLAGS})
 endif()
 
 if(MSVC)
@@ -226,21 +228,10 @@ if(MSVC)
         /W4
         /permissive-
         /utf-8
-        /Zc:__cplusplus
-        /Zc:preprocessor
-        /Zc:inline
-        /Zc:lambda
-        /Zc:externConstexpr
-        /Zc:throwingNew
+        /Zc:__cplusplus /Zc:preprocessor /Zc:inline /Zc:lambda /Zc:externConstexpr /Zc:throwingNew
         /EHs-c-
         /GR-
-        /w14242
-        /w14254
-        /w14265
-        /w14287
-        /w14296
-        /w14456
-        /w14457
+        /w14242 /w14254 /w14265 /w14287 /w14296 /w14456 /w14457
         $<$<CONFIG:Release>:/O2 /Ob3 /Oi /Ot /fp:precise /fp:except- /Gy /Gw /GS->
         $<$<CONFIG:Debug>:/Od /Zi /RTC1>
     )
@@ -319,17 +310,19 @@ file(GLOB SHADER_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/shaders/
 
 set(ALL_SHADER_SPVS "")
 
+file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/shaders")
+
 foreach(SHADER_SRC IN LISTS SHADER_SOURCES)
     get_filename_component(SHADER_NAME ${SHADER_SRC} NAME_WE)
     get_filename_component(SHADER_FILENAME ${SHADER_SRC} NAME)
     
-    set(SHADER_SPV "${CMAKE_CURRENT_BINARY_DIR}/${SHADER_NAME}.spirv")
+    set(SHADER_SPV "${CMAKE_CURRENT_BINARY_DIR}/shaders/${SHADER_NAME}.spirv")
 
     add_custom_command(
         OUTPUT ${SHADER_SPV}
         COMMAND ${SLANGC_EXECUTABLE} ${SHADER_SRC} -target spirv -profile glsl_460 -O3 -o ${SHADER_SPV}
         DEPENDS ${SHADER_SRC}
-        COMMENT "Compiling ${SHADER_FILENAME} to ${SHADER_NAME}.spirv..."
+        COMMENT "Compiling ${SHADER_FILENAME} to shaders/${SHADER_NAME}.spirv..."
         VERBATIM
     )
 
@@ -347,6 +340,8 @@ endif()
 
 if(ALL_SHADER_SPVS)
     add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${ALL_SHADER_SPVS} $<TARGET_FILE_DIR:${PROJECT_NAME}>
+        COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:${PROJECT_NAME}>/shaders"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${ALL_SHADER_SPVS} "$<TARGET_FILE_DIR:${PROJECT_NAME}>/shaders/"
+        COMMENT "Copying compiled shaders to output directory..."
     )
 endif()
