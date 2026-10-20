@@ -2,11 +2,7 @@ cmake_minimum_required(VERSION 3.24)
 
 # Build options
 if(NOT DEFINED COMP)
-    if(WIN32)
-        set(COMP "msvc")
-    else()
-        set(COMP "clang")
-    endif()
+    set(COMP "clang")
 endif()
 
 if(NOT DEFINED ARCH)
