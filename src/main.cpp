@@ -1,6 +1,5 @@
-#include "engine/engine.hpp"
-
 #include <mimalloc-new-delete.h>
+#include "engine/engine.hpp"
 
 int main()
 {

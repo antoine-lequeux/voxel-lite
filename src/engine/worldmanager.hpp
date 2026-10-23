@@ -3,106 +3,128 @@
 #include "chunkgenerator.hpp"
 #include "containers.hpp"
 
+#include <TaskScheduler.h>
+
 #include <chrono>
 #include <deque>
 
 namespace vl
 {
 
-constexpr u32 MAX_ACTIVE_CHUNKS = 32768;
-
-constexpr i32 MIN_CHUNK_Y = -8;
-constexpr i32 MAX_CHUNK_Y = 31;
-constexpr i32 WORLD_HEIGHT_CHUNKS = MAX_CHUNK_Y - MIN_CHUNK_Y + 1;
-
-constexpr i32 MIN_RENDER_DIST = 4;
-constexpr i32 MAX_RENDER_DIST = 64;
-constexpr i32 DEFAULT_RENDER_DIST = 24;
-
 constexpr i32 NEAR_RADIUS = 3;
 
 // Per-frame budgets
-constexpr f64 GEN_TIME_BUDGET_MS = 3.0;
-constexpr f64 MESH_TIME_BUDGET_MS = 4.0;
-constexpr u32 MAX_CHUNKS_GENERATED_PER_FRAME = 64;
-constexpr u32 MAX_CHUNKS_MESHED_PER_FRAME = 64;
-constexpr u32 MAX_AIR_CHUNKS_PER_FRAME = 16384;
+constexpr f64 SKY_AIR_TIME_BUDGET_MS = 2.0;
+constexpr f64 BFS_MIN_INTERVAL_MS = 250.0;
+constexpr u32 GEN_WORK_BUDGET_PER_FRAME = 2048;
+constexpr u32 MESH_WORK_BUDGET_PER_FRAME = 2048;
+constexpr u32 MAX_GEN_BATCH_CHUNKS = 2048;
+constexpr u32 MAX_MESH_BATCH_CHUNKS = 2048;
+constexpr u64 MAX_UPLOAD_BYTES_PER_FRAME = 16ull * 1024ull * 1024ull;
 
 class WorldManager
 {
 public:
 
     explicit WorldManager(i32 seed);
+    ~WorldManager();
+
+    WorldManager(const WorldManager&) = delete;
+    WorldManager& operator=(const WorldManager&) = delete;
+    WorldManager(WorldManager&&) = delete;
+    WorldManager& operator=(WorldManager&&) = delete;
 
     [[nodiscard]] i32 get_render_distance() const { return m_render_distance; }
     void set_render_distance(i32 rd) { m_render_distance = std::clamp(rd, MIN_RENDER_DIST, MAX_RENDER_DIST); }
 
-    [[nodiscard]] u32 get_active_chunks_count() const { return m_pool.size(); }
-    [[nodiscard]] u32 get_air_chunks_count() const { return static_cast<u32>(m_air_chunks.size()); }
-    [[nodiscard]] u32 get_pending_generation_count() const { return static_cast<u32>(m_gen_candidates.size()); }
-    [[nodiscard]] static constexpr u32 get_max_chunks_capacity() { return MAX_ACTIVE_CHUNKS; }
+    [[nodiscard]] u32 get_active_chunks_count() const { return m_pools.total_active_chunks(); }
+    [[nodiscard]] u32 get_air_chunks_count() const { return m_air_chunks_count; }
+    [[nodiscard]] u32 get_pending_generation_count() const
+    {
+        u32 total = 0;
+        for (const auto& q : m_gen_queues) total += static_cast<u32>(q.size());
+        return total;
+    }
+    [[nodiscard]] static constexpr u32 get_max_chunks_capacity() { return LodPoolGroup::total_capacity(); }
 
-    [[nodiscard]] auto get_active_chunks() { return m_pool.zipped(); }
-    [[nodiscard]] auto get_active_chunks() const { return m_pool.zipped(); }
+    template <u32 Lod = 1>
+        requires(Lod >= 1 && Lod <= MAX_LOD)
+    [[nodiscard]] u32 get_lod_chunks_count() const
+    {
+        return m_pools.pool<Lod>().size();
+    }
 
-    [[nodiscard]] auto get_active_meshes() { return m_pool.active_meshes(); }
-    [[nodiscard]] auto get_active_meshes() const { return m_pool.active_meshes(); }
+    template <typename Fn>
+    void for_each_active_mesh(Fn&& fn) const
+    {
+        m_pools.for_each_active_mesh(std::forward<Fn>(fn));
+    }
+
+    void destroy_all_gpu_resources(vulk::VulkanContext& ctx);
 
     [[nodiscard]] static constexpr bool is_y_in_world(i32 cy) { return cy >= MIN_CHUNK_Y && cy <= MAX_CHUNK_Y; }
 
-    [[nodiscard]] Chunk* get_chunk(const glm::ivec3& coord)
+    // Computes which LOD a chunk belongs to
+    [[nodiscard]] static constexpr u8 compute_lod(const glm::ivec3& coord, const glm::ivec3& origin)
     {
-        const u32 slot = find_real_slot(coord);
-        return (slot != INVALID_POOL_INDEX) ? &m_pool.chunk_at(slot) : nullptr;
+        const i32 dist = std::max({
+            std::abs(coord.x - origin.x),
+            std::abs(coord.y - origin.y),
+            std::abs(coord.z - origin.z),
+        });
+
+        for (u32 lod = 1; lod <= MAX_LOD; ++lod)
+            if (dist <= LOD_BOX_RADII[lod - 1u]) return static_cast<u8>(lod);
+        return static_cast<u8>(MAX_LOD);
     }
 
-    [[nodiscard]] const Chunk* get_chunk(const glm::ivec3& coord) const
+    // Estimated CPU work weight of generating or meshing a chunk
+    [[nodiscard]] static constexpr u32 lod_work_cost(u8 lod)
     {
-        const u32 slot = find_real_slot(coord);
-        return (slot != INVALID_POOL_INDEX) ? &m_pool.chunk_at(slot) : nullptr;
+        switch (lod)
+        {
+            case 1: return 32u;
+            case 2: return 16u;
+            case 3: return 8u;
+            case 4: return 2u;
+            default: return 1u;
+        }
+    }
+
+    template <u32 Lod = 1>
+        requires(Lod >= 1 && Lod <= MAX_LOD)
+    [[nodiscard]] Chunk<Lod>* get_chunk(const glm::ivec3& coord)
+    {
+        const GridCell* cell = find_real_cell(coord);
+        if (cell == nullptr || cell->lod() != Lod) return nullptr;
+        return &m_pools.pool<Lod>().chunk_at(cell->index);
+    }
+
+    template <u32 Lod = 1>
+        requires(Lod >= 1 && Lod <= MAX_LOD)
+    [[nodiscard]] const Chunk<Lod>* get_chunk(const glm::ivec3& coord) const
+    {
+        const GridCell* cell = find_real_cell(coord);
+        if (cell == nullptr || cell->lod() != Lod) return nullptr;
+        return &m_pools.pool<Lod>().chunk_at(cell->index);
     }
 
     [[nodiscard]] ChunkMesh* get_mesh(const glm::ivec3& coord)
     {
-        const u32 slot = find_real_slot(coord);
-        return (slot != INVALID_POOL_INDEX) ? &m_pool.mesh_at(slot) : nullptr;
+        const GridCell* cell = find_real_cell(coord);
+        if (cell == nullptr) return nullptr;
+        return m_pools.visit_lod(cell->lod(), [&](auto& pool) { return &pool.mesh_at(cell->index); });
     }
 
-    // True if the chunk is loaded as an air chunk (no block data stored)
-    [[nodiscard]] bool is_air_chunk(const glm::ivec3& coord) const { return find_air_index(coord) != INVALID_POOL_INDEX; }
+    [[nodiscard]] bool is_air_chunk(const glm::ivec3& coord) const
+    {
+        if (!is_in_active_window(coord)) return false;
+        return m_grid[cell_index(coord)].is_air();
+    }
 
     void set_world_block(i32 wx, i32 wy, i32 wz, BlockID id);
 
-    // Raw neighbor pointers (nullptr for anything that is not a real loaded chunk)
-    [[nodiscard]] ChunkNeighbors get_neighbors(const glm::ivec3& coord) const
-    {
-        return ChunkNeighbors {
-            .left = get_chunk(coord + glm::ivec3(-1, 0, 0)),
-            .right = get_chunk(coord + glm::ivec3(1, 0, 0)),
-            .down = get_chunk(coord + glm::ivec3(0, -1, 0)),
-            .up = get_chunk(coord + glm::ivec3(0, 1, 0)),
-            .back = get_chunk(coord + glm::ivec3(0, 0, -1)),
-            .front = get_chunk(coord + glm::ivec3(0, 0, 1)),
-        };
-    }
-
-    bool unload_chunk(const glm::ivec3& coord, vulk::VulkanContext& ctx)
-    {
-        const u32 slot = find_real_slot(coord);
-        if (slot != INVALID_POOL_INDEX)
-        {
-            unload_real_chunk(slot, ctx);
-            return true;
-        }
-
-        const u32 air_idx = find_air_index(coord);
-        if (air_idx != INVALID_POOL_INDEX)
-        {
-            remove_air_chunk(air_idx);
-            return true;
-        }
-        return false;
-    }
+    bool unload_chunk(const glm::ivec3& coord, vulk::VulkanContext& ctx);
 
     void update(const glm::vec3& cam_world_pos, vulk::VulkanContext& ctx);
 
@@ -113,15 +135,80 @@ private:
     // Grid covering the maximum render window
     static constexpr i32 GRID_XZ = (2 * MAX_RENDER_DIST) + 1;
     static constexpr u32 GRID_CELLS = static_cast<u32>(GRID_XZ * GRID_XZ * WORLD_HEIGHT_CHUNKS);
+    static constexpr u32 BITSET_WORDS = (GRID_CELLS + 63u) / 64u;
 
-    // Cell state encoding
-    static constexpr u32 STATE_EMPTY = 0xFFFFFFFFu; // Not loaded
-    static constexpr u32 AIR_BIT = 0x80000000u;     // Air chunk, low bits = index into m_air_chunks
+    struct GridCell
+    {
+        static constexpr u32 TAG_UNLOADED = 0u;
+        static constexpr u32 ALL_PORTALS = 0b00111111u;
 
-    static_assert(MAX_ACTIVE_CHUNKS < AIR_BIT);
+        // Tag encoding (4 bits):
+        //   0                            = unloaded
+        //   1..MAX_LOD                   = real chunk at LOD 'tag'
+        //   (MAX_LOD + 1)..(2 * MAX_LOD) = air chunk evaluated at LOD 'tag - MAX_LOD' (1 = guaranteed air at all LODs)
+        u32 tag : 4 = TAG_UNLOADED;
+        u32 portal_mask : 6 = 0u;
+        u32 index : 22 = 0u;
+        u32 loaded_epoch = 0u;
+        u32 frontier_stamp = 0u;
 
-    [[nodiscard]] static constexpr bool is_real_state(u32 st) { return st < AIR_BIT; }
-    [[nodiscard]] static constexpr bool is_air_state(u32 st) { return st != STATE_EMPTY && (st & AIR_BIT) != 0u; }
+        [[nodiscard]] constexpr bool is_unloaded() const { return tag == TAG_UNLOADED; }
+        [[nodiscard]] constexpr bool is_real() const { return tag >= 1u && tag <= MAX_LOD; }
+        [[nodiscard]] constexpr bool is_air() const { return tag > MAX_LOD; }
+        [[nodiscard]] constexpr u8 lod() const { return static_cast<u8>(tag <= MAX_LOD ? tag : (tag - MAX_LOD)); }
+
+        [[nodiscard]] constexpr bool needs_lod_update(u8 target_lod) const
+        {
+            if (is_real()) return lod() != target_lod;
+            if (is_air()) return target_lod < lod();
+            return false;
+        }
+
+        [[nodiscard]] constexpr u16 pack_bfs_state() const { return static_cast<u16>((portal_mask << 4u) | tag); }
+    };
+
+    // BFS queue entry supporting render distances up to 2047 chunks
+    struct SearchNode
+    {
+        i32 dx : 12;
+        i32 dz : 12;
+        i32 y : 8;
+    };
+
+    static_assert(sizeof(SearchNode) == 4);
+
+    struct GenTaskItem
+    {
+        glm::ivec3 coord {};
+        u32 slot = 0;
+        i32 column_max_height = 0;
+        u8 target_lod = 1;
+        u8 old_portal_mask = 0;
+        bool was_unloaded = false;
+        bool was_real = false;
+        bool had_old_mesh = false;
+        bool high_priority = false;
+        bool non_air = false;
+        bool guaranteed_all_lods = false;
+        u8 portal_mask = 0;
+    };
+
+    struct MeshTaskItem
+    {
+        glm::ivec3 coord {};
+        u32 slot = 0;
+        u8 lod = 1;
+        ChunkNeighbors neighbors {};
+    };
+
+    struct BackgroundBfsTask : enki::ITaskSet
+    {
+        WorldManager* manager = nullptr;
+
+        explicit BackgroundBfsTask(WorldManager* mgr) : enki::ITaskSet(1), manager(mgr) { m_Priority = enki::TASK_PRIORITY_LOW; }
+
+        void ExecuteRange(enki::TaskSetPartition, u32) override { manager->execute_background_bfs(); }
+    };
 
     static constexpr std::array<glm::ivec3, 6> DIR_OFFSETS {{
         {-1, 0, 0}, // Left
@@ -143,48 +230,70 @@ private:
         return static_cast<u32>((((c.y - MIN_CHUNK_Y) * GRID_XZ + wrap_xz(c.z)) * GRID_XZ) + wrap_xz(c.x));
     }
 
-    [[nodiscard]] u32 find_real_slot(const glm::ivec3& coord) const
+    [[nodiscard]] bool is_in_active_window(const glm::ivec3& c) const
     {
-        if (!is_y_in_world(coord.y)) return INVALID_POOL_INDEX;
-        const u32 st = m_cell_state[cell_index(coord)];
-        if (!is_real_state(st) || m_pool.chunk_at(st).coord != coord) return INVALID_POOL_INDEX;
-        return st;
+        if (!m_has_last_origin || !is_y_in_world(c.y)) return false;
+        return std::abs(c.x - m_last_origin.x) <= m_last_render_distance &&
+               std::abs(c.z - m_last_origin.z) <= m_last_render_distance;
     }
 
-    [[nodiscard]] u32 find_air_index(const glm::ivec3& coord) const
+    void clear_cell(u32 idx, GridCell& cell)
     {
-        if (!is_y_in_world(coord.y)) return INVALID_POOL_INDEX;
-        const u32 st = m_cell_state[cell_index(coord)];
-        if (!is_air_state(st)) return INVALID_POOL_INDEX;
-        const u32 idx = st & ~AIR_BIT;
-        return (m_air_chunks[idx] == coord) ? idx : INVALID_POOL_INDEX;
+        cell.tag = GridCell::TAG_UNLOADED;
+        cell.portal_mask = 0u;
+        cell.index = 0u;
+        m_cell_bfs_state[idx] = 0u;
     }
 
-    // Fully opaque chunk used to replace unknown chunks during meshing
-    [[nodiscard]] static const Chunk& solid_sentinel()
+    void set_cell_air(u32 idx, GridCell& cell, u8 air_lod)
     {
-        static const std::unique_ptr<Chunk> sentinel = [] {
-            auto c = std::make_unique<Chunk>();
-            c->fill(BlockType::Stone);
-            c->recalculate_portal_mask();
-            return c;
-        }();
-        return *sentinel;
+        cell.tag = static_cast<u32>(MAX_LOD + air_lod);
+        cell.portal_mask = GridCell::ALL_PORTALS;
+        cell.index = 0u;
+        cell.loaded_epoch = ++m_current_epoch;
+        m_cell_bfs_state[idx] = cell.pack_bfs_state();
     }
 
-    [[nodiscard]] const Chunk* mesh_neighbor(const glm::ivec3& coord) const
+    void set_cell_real(u32 idx, GridCell& cell, u8 chunk_lod, u32 pool_slot, u8 portals)
     {
-        if (!is_y_in_world(coord.y)) return nullptr; // Guaranteed empty
+        cell.tag = chunk_lod;
+        cell.portal_mask = portals & GridCell::ALL_PORTALS;
+        cell.index = pool_slot;
+        cell.loaded_epoch = ++m_current_epoch;
+        m_cell_bfs_state[idx] = cell.pack_bfs_state();
+    }
 
-        const u32 st = m_cell_state[cell_index(coord)];
-        if (is_real_state(st))
+    void update_cell_portals(u32 idx, GridCell& cell, u8 portals)
+    {
+        cell.portal_mask = portals & GridCell::ALL_PORTALS;
+        cell.loaded_epoch = ++m_current_epoch;
+        m_cell_bfs_state[idx] = cell.pack_bfs_state();
+    }
+
+    [[nodiscard]] const GridCell* find_real_cell(const glm::ivec3& coord) const
+    {
+        if (!is_in_active_window(coord)) return nullptr;
+        const GridCell& cell = m_grid[cell_index(coord)];
+        if (!cell.is_real()) return nullptr;
+        return &cell;
+    }
+
+    [[nodiscard]] NeighborChunk mesh_neighbor(const glm::ivec3& coord) const
+    {
+        if (!is_y_in_world(coord.y)) return NeighborChunk::air();
+        if (!is_in_active_window(coord)) return NeighborChunk::solid();
+
+        const GridCell& cell = m_grid[cell_index(coord)];
+        if (cell.is_real())
         {
-            const Chunk& c = m_pool.chunk_at(st);
-            return (c.coord == coord) ? &c : &solid_sentinel();
+            return m_pools.visit_lod(cell.lod(), [&](const auto& pool) -> NeighborChunk {
+                return NeighborChunk::from_chunk(pool.chunk_at(cell.index));
+            });
         }
-        if (is_air_state(st) && m_air_chunks[st & ~AIR_BIT] == coord) return nullptr; // Air
 
-        return &solid_sentinel(); // Unknown
+        if (cell.is_air()) return NeighborChunk::air();
+
+        return NeighborChunk::solid();
     }
 
     [[nodiscard]] ChunkNeighbors get_mesh_neighbors(const glm::ivec3& coord) const
@@ -199,164 +308,79 @@ private:
         };
     }
 
-    [[nodiscard]] static constexpr u32 pack_entry(i32 dx, i32 y, i32 dz)
+    template <typename ChunkT>
+    [[nodiscard]] static constexpr u8 extract_portal_mask(const ChunkT& chunk)
     {
-        return static_cast<u32>(dx + MAX_RENDER_DIST) | (static_cast<u32>(dz + MAX_RENDER_DIST) << 8u) |
-               (static_cast<u32>(y - MIN_CHUNK_Y) << 16u);
+        u8 mask = 0;
+        for (u8 d = 0; d < 6; ++d)
+            if (chunk.has_portal(static_cast<Direction>(d))) mask |= static_cast<u8>(1u << d);
+        return mask;
     }
 
-    [[nodiscard]] u32 entry_cell(i32 dx, i32 y, i32 dz) const
-    {
-        const i32 wz = m_wrap_z[static_cast<usize>(dz + MAX_RENDER_DIST)];
-        const i32 wx = m_wrap_x[static_cast<usize>(dx + MAX_RENDER_DIST)];
-        return static_cast<u32>((((y - MIN_CHUNK_Y) * GRID_XZ + wz) * GRID_XZ) + wx);
-    }
+    void start_background_bfs(const glm::ivec3& origin, i32 rd);
+    void harvest_background_bfs(const glm::ivec3& origin, vulk::VulkanContext& ctx);
+    void execute_background_bfs();
 
-    // Mark every wanted cell and return the number of loaded chunks (real + air) that were reached.
-    u32 run_search(const glm::ivec3& origin, i32 rd);
+    // Returns true if at least one unloaded neighbor was newly queued
+    bool expand_frontier_from(
+        const glm::ivec3& coord, const GridCell& start_cell, const glm::ivec3& origin, i32 rd, bool high_priority = false
+    );
 
-    [[nodiscard]] u32 allocate_real_chunk(const glm::ivec3& coord)
-    {
-        const u32 slot = m_pool.allocate(coord);
-        m_cell_state[cell_index(coord)] = slot;
-        m_slot_meshed[slot] = 0;
-        m_mesh_queue.push_back(coord);
-        return slot;
-    }
+    // Fills all unloaded air chunks in a column strictly above 'col_max_height' and expands their frontier
+    void fill_air_column_above(i32 cx, i32 cz, i32 col_max_height, const glm::ivec3& origin, i32 rd);
 
-    void unload_real_chunk(u32 slot, vulk::VulkanContext& ctx)
-    {
-        const glm::ivec3 coord = m_pool.chunk_at(slot).coord;
-        m_cell_state[cell_index(coord)] = STATE_EMPTY;
-        m_slot_meshed[slot] = 0;
-        m_pool.free(slot, ctx);
-    }
+    void unload_real_chunk(u8 lod, u32 slot, vulk::VulkanContext& ctx);
+    void unload_cell_at(const glm::ivec3& coord, vulk::VulkanContext& ctx);
+    void unload_out_of_range(const glm::ivec3& new_origin, i32 new_rd, vulk::VulkanContext& ctx);
 
-    void add_air_chunk(const glm::ivec3& coord)
-    {
-        const u32 idx = static_cast<u32>(m_air_chunks.size());
-        m_air_chunks.push_back(coord);
-        m_cell_state[cell_index(coord)] = AIR_BIT | idx;
-    }
-
-    void remove_air_chunk(u32 idx)
-    {
-        m_cell_state[cell_index(m_air_chunks[idx])] = STATE_EMPTY;
-
-        const u32 last = static_cast<u32>(m_air_chunks.size()) - 1u;
-        if (idx != last)
-        {
-            m_air_chunks[idx] = m_air_chunks[last];
-            m_cell_state[cell_index(m_air_chunks[idx])] = AIR_BIT | idx;
-        }
-        m_air_chunks.pop_back();
-    }
-
-    // Returns true if any real chunk was unloaded
-    bool unload_out_of_range(const glm::ivec3& origin, i32 rd, vulk::VulkanContext& ctx)
-    {
-        auto out_of_range = [&](const glm::ivec3& c) { return std::abs(c.x - origin.x) > rd || std::abs(c.z - origin.z) > rd; };
-
-        bool freed = false;
-        for (i32 i = static_cast<i32>(m_pool.size()) - 1; i >= 0; --i)
-        {
-            const u32 slot = m_pool.active_slot(static_cast<u32>(i));
-            if (out_of_range(m_pool.chunk_at(slot).coord))
-            {
-                unload_real_chunk(slot, ctx);
-                freed = true;
-            }
-        }
-
-        for (i32 i = static_cast<i32>(m_air_chunks.size()) - 1; i >= 0; --i)
-            if (out_of_range(m_air_chunks[static_cast<usize>(i)])) remove_air_chunk(static_cast<u32>(i));
-
-        if (freed) m_search_dirty = true;
-        return freed;
-    }
-
-    // Unloads every loaded chunk that was not marked as wanted by the last search. Returns true if any real chunk was freed.
-    bool unload_unwanted(vulk::VulkanContext& ctx)
-    {
-        const u32 stamp = m_frame_stamp;
-        bool freed = false;
-
-        for (i32 i = static_cast<i32>(m_pool.size()) - 1; i >= 0; --i)
-        {
-            const u32 slot = m_pool.active_slot(static_cast<u32>(i));
-            if (m_cell_stamp[cell_index(m_pool.chunk_at(slot).coord)] != stamp)
-            {
-                unload_real_chunk(slot, ctx);
-                freed = true;
-            }
-        }
-
-        for (i32 i = static_cast<i32>(m_air_chunks.size()) - 1; i >= 0; --i)
-            if (m_cell_stamp[cell_index(m_air_chunks[static_cast<usize>(i)])] != stamp) remove_air_chunk(static_cast<u32>(i));
-
-        return freed;
-    }
-
-    void generate_wanted_chunks(vulk::VulkanContext& ctx);
-
-    // Queues meshed real neighbors for a priority remesh
-    void on_chunk_loaded(const glm::ivec3& coord)
-    {
-        for (const glm::ivec3& o : DIR_OFFSETS)
-        {
-            const glm::ivec3 n = coord + o;
-            const u32 slot = find_real_slot(n);
-            if (slot == INVALID_POOL_INDEX || m_slot_meshed[slot] == 0u) continue;
-
-            Chunk& c = m_pool.chunk_at(slot);
-            if (c.mesh_dirty) continue; // Already queued
-
-            c.mesh_dirty = true;
-            m_remesh_queue.push_back(n);
-        }
-    }
-
-    void mark_dirty(const glm::ivec3& coord)
-    {
-        const u32 slot = find_real_slot(coord);
-        if (slot == INVALID_POOL_INDEX) return;
-
-        Chunk& c = m_pool.chunk_at(slot);
-        if (c.mesh_dirty) return; // Already queued
-
-        c.mesh_dirty = true;
-        m_remesh_queue.push_back(coord);
-    }
-
+    void generate_wanted_chunks(const glm::ivec3& origin, i32 rd, vulk::VulkanContext& ctx);
+    void on_chunk_loaded(const glm::ivec3& coord, bool high_priority = false);
+    void mark_dirty(const glm::ivec3& coord);
     void process_mesh_queues(vulk::VulkanContext& ctx);
 
-    // Spatial grid
-    std::unique_ptr<u32[]> m_cell_state;
-    std::unique_ptr<u32[]> m_cell_stamp;
-    u32 m_frame_stamp = 0;
-    std::array<i32, GRID_XZ> m_wrap_x {};
-    std::array<i32, GRID_XZ> m_wrap_z {};
+    // Spatial grid (main thread)
+    std::unique_ptr<GridCell[]> m_grid;
+    std::unique_ptr<u16[]> m_cell_bfs_state;
+    u32 m_current_epoch = 0;
+    u32 m_frontier_stamp = 1;
+    u32 m_air_chunks_count = 0;
 
-    // Loaded air chunks as coordinates
-    std::vector<glm::ivec3> m_air_chunks;
+    // Background BFS state (isolated from main thread)
+    BackgroundBfsTask m_bfs_task;
+    std::unique_ptr<u16[]> m_bfs_snapshot;
+    std::unique_ptr<u64[]> m_bfs_visited_bits;
+    std::vector<SearchNode> m_bfs_queue;
+    std::vector<glm::ivec3> m_bfs_out_candidates;
+    std::vector<glm::ivec3> m_bfs_out_unwanted;
+    glm::ivec3 m_bfs_origin {0, 0, 0};
+    i32 m_bfs_rd = 0;
+    u32 m_bfs_start_epoch = 0;
+    bool m_bfs_in_flight = false;
+    bool m_bfs_needs_rerun = false;
+    Clock::time_point m_last_bfs_time {};
 
-    // Search state
-    std::vector<u32> m_bfs_queue;
-    std::vector<glm::ivec3> m_gen_candidates; // Wanted but not loaded
+    // Per-LOD generation and meshing queues (index 0 = LOD 1, index MAX_LOD-1 = LOD 5)
+    std::deque<glm::ivec3> m_urgent_gen_queue {};
+    std::array<std::deque<glm::ivec3>, MAX_LOD> m_gen_queues {};
+    std::vector<glm::ivec3> m_frontier_during_bfs;
     std::vector<glm::ivec3> m_near_offsets;
     glm::ivec3 m_last_origin {0, 0, 0};
     i32 m_last_render_distance = 0;
     bool m_has_last_origin = false;
     bool m_search_dirty = true;
 
-    // Meshing
-    std::deque<glm::ivec3> m_remesh_queue; // Meshed chunks needing a remesh in priority
-    std::deque<glm::ivec3> m_mesh_queue;   // Chunks never meshed
-    std::unique_ptr<u8[]> m_slot_meshed;
+    std::array<std::deque<glm::ivec3>, MAX_LOD> m_remesh_queues {};
+    std::array<std::deque<glm::ivec3>, MAX_LOD> m_mesh_queues {};
 
-    ChunkPool<MAX_ACTIVE_CHUNKS> m_pool {};
+    // Multithreaded worker state
+    enki::TaskScheduler m_scheduler {};
+    std::vector<ChunkGenerator> m_worker_generators {};
+    std::vector<GenTaskItem> m_gen_batch {};
+    std::vector<MeshTaskItem> m_mesh_batch {};
+
+    // Per-LOD chunk pools
+    LodPoolGroup m_pools {};
     i32 m_render_distance = DEFAULT_RENDER_DIST;
-    ChunkGenerator m_generator {};
 };
 
 } // namespace vl

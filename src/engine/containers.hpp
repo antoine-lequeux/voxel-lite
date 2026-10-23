@@ -2,7 +2,6 @@
 
 #include "chunk.hpp"
 
-#include <bit>
 #include <memory>
 
 namespace vl
@@ -10,143 +9,71 @@ namespace vl
 
 inline constexpr u32 INVALID_POOL_INDEX = std::numeric_limits<u32>::max();
 
-template <u32 Capacity = 4096>
-    requires(std::has_single_bit(Capacity)) // Must be a power of 2 for bitwise modulo
-class FlatSpatialMap
-{
-public:
+inline constexpr i32 MIN_CHUNK_Y = -8;
+inline constexpr i32 MAX_CHUNK_Y = 23;
+inline constexpr i32 WORLD_HEIGHT_CHUNKS = MAX_CHUNK_Y - MIN_CHUNK_Y + 1;
 
-    static constexpr u32 MASK = Capacity - 1u;
-    static constexpr u32 MAX_LOAD = (Capacity * 3u) / 4u; // 75% max load factor to guarantee low average probe length
+inline constexpr i32 MIN_RENDER_DIST = 4;
+inline constexpr i32 MAX_RENDER_DIST = 256;
+inline constexpr i32 DEFAULT_RENDER_DIST = 32;
 
-    struct alignas(16) Slot
-    {
-        glm::ivec3 coord {0, 0, 0};
-        u32 pool_index = INVALID_POOL_INDEX;
-    };
-
-    static_assert(sizeof(Slot) == 16, "Slot must be 16 bytes for cache-line alignment");
-
-    FlatSpatialMap() : m_slots(std::make_unique<Slot[]>(Capacity)) { clear(); }
-
-    [[nodiscard]] static constexpr u32 hash_coord(const glm::ivec3& v)
-    {
-        // Spatial prime mix and full Murmur3 32-bit avalanche bit mixing
-        u32 h = (static_cast<u32>(v.x) * 73856093u) ^ (static_cast<u32>(v.y) * 19349663u) ^ (static_cast<u32>(v.z) * 83492791u);
-        h ^= h >> 16u;
-        h *= 0x85ebca6bu;
-        h ^= h >> 13u;
-        h *= 0xc2b2ae35u;
-        h ^= h >> 16u;
-        return h;
-    }
-
-    [[nodiscard]] u32 find(const glm::ivec3& coord) const
-    {
-        u32 slot_idx = hash_coord(coord) & MASK;
-
-        while (true)
-        {
-            const Slot& slot = m_slots[slot_idx];
-            if (slot.pool_index == INVALID_POOL_INDEX) return INVALID_POOL_INDEX;
-            if (slot.coord == coord) return slot.pool_index;
-
-            slot_idx = (slot_idx + 1u) & MASK;
-        }
-    }
-
-    [[nodiscard]] bool contains(const glm::ivec3& coord) const { return find(coord) != INVALID_POOL_INDEX; }
-
-    bool insert_or_assign(const glm::ivec3& coord, u32 pool_index)
-    {
-        assert(m_size < MAX_LOAD && "FlatSpatialMap capacity exceeded");
-        if (m_size >= MAX_LOAD) return false;
-
-        u32 slot_idx = hash_coord(coord) & MASK;
-
-        while (true)
-        {
-            Slot& slot = m_slots[slot_idx];
-            if (slot.pool_index == INVALID_POOL_INDEX)
-            {
-                slot.coord = coord;
-                slot.pool_index = pool_index;
-                ++m_size;
-                return true; // Newly inserted
-            }
-            if (slot.coord == coord)
-            {
-                slot.pool_index = pool_index;
-                return false; // Updated existing key
-            }
-
-            slot_idx = (slot_idx + 1u) & MASK;
-        }
-    }
-
-    // Knuth algorithm R
-    bool erase(const glm::ivec3& coord)
-    {
-        u32 i = hash_coord(coord) & MASK;
-
-        while (true)
-        {
-            if (m_slots[i].pool_index == INVALID_POOL_INDEX) return false;
-            if (m_slots[i].coord == coord) break;
-            i = (i + 1u) & MASK;
-        }
-
-        u32 j = (i + 1u) & MASK;
-        while (m_slots[j].pool_index != INVALID_POOL_INDEX)
-        {
-            const u32 k = hash_coord(m_slots[j].coord) & MASK;
-
-            // Cyclically check if slot i lies on the probe path from k to j
-            if (((j - i) & MASK) <= ((j - k) & MASK))
-            {
-                m_slots[i] = m_slots[j];
-                i = j;
-            }
-            j = (j + 1u) & MASK;
-        }
-
-        m_slots[i].pool_index = INVALID_POOL_INDEX;
-        --m_size;
-        return true;
-    }
-
-    void clear()
-    {
-        for (u32 i = 0; i < Capacity; ++i) m_slots[i].pool_index = INVALID_POOL_INDEX;
-        m_size = 0;
-    }
-
-    [[nodiscard]] constexpr u32 size() const { return m_size; }
-    [[nodiscard]] static constexpr u32 capacity() { return Capacity; }
-
-private:
-
-    std::unique_ptr<Slot[]> m_slots;
-    u32 m_size = 0;
+// Half extents (in chunks) of the box around the camera chunk for each LOD
+inline constexpr std::array<i32, MAX_LOD> LOD_BOX_RADII = {
+    12,              // LOD 1
+    24,              // LOD 2
+    48,              // LOD 3
+    96,              // LOD 4
+    MAX_RENDER_DIST, // LOD 5
 };
 
-template <u32 MaxChunks = 2048>
+// Computes at compile time the maximum number of chunks that can fit inside an LOD's 3D box
+template <u32 Lod>
+    requires(Lod >= 1 && Lod <= MAX_LOD)
+consteval u32 compute_lod_pool_capacity()
+{
+    const i32 configured_r = LOD_BOX_RADII[Lod - 1u];
+    const i32 r_out = (Lod == MAX_LOD) ? std::max(configured_r, MAX_RENDER_DIST) : configured_r;
+    const u32 xz_out = static_cast<u32>((2 * r_out) + 1);
+    const u32 y_out = static_cast<u32>(std::min((2 * r_out) + 1, WORLD_HEIGHT_CHUNKS));
+    const u32 outer_vol = xz_out * xz_out * y_out;
+
+    if constexpr (Lod == 1)
+    {
+        return outer_vol + (2u * xz_out * y_out);
+    }
+    else
+    {
+        const i32 r_in = LOD_BOX_RADII[Lod - 2u];
+        if (r_in >= r_out) return 2u * xz_out * y_out;
+
+        const u32 xz_in = static_cast<u32>((2 * r_in) + 1);
+        const u32 min_y_in = static_cast<u32>(std::min(r_in + 1, WORLD_HEIGHT_CHUNKS));
+        const u32 min_inner_vol = xz_in * xz_in * min_y_in;
+        const u32 transition_slack = 2u * xz_out * y_out;
+        return std::max(1u, (outer_vol - min_inner_vol) + transition_slack);
+    }
+}
+
+template <u32 Lod, u32 MaxChunks = compute_lod_pool_capacity<Lod>()>
+    requires(Lod >= 1 && Lod <= MAX_LOD)
 class ChunkPool
 {
 public:
 
+    using ChunkType = Chunk<Lod>;
+    static constexpr u32 LOD = Lod;
+
     ChunkPool()
-        : m_chunks(MaxChunks), m_meshes(std::make_unique<ChunkMesh[]>(MaxChunks)),
-          m_active_slots(std::make_unique<u32[]>(MaxChunks)), m_slot_to_active(std::make_unique<u32[]>(MaxChunks)),
-          m_free_slots(std::make_unique<u32[]>(MaxChunks))
+        : m_chunks(MaxChunks), m_active_slots(std::make_unique<u32[]>(MaxChunks)),
+          m_slot_to_active(std::make_unique<u32[]>(MaxChunks)), m_free_slots(std::make_unique<u32[]>(MaxChunks))
     {
         for (u32 i = 0; i < MaxChunks; ++i)
         {
             m_slot_to_active[i] = INVALID_POOL_INDEX;
-            // Push slots in reverse order so slot 0 is popped first
             m_free_slots[i] = (MaxChunks - 1u) - i;
         }
         m_free_count = MaxChunks;
+        m_meshes.reserve(4096);
     }
 
     [[nodiscard]] constexpr u32 size() const { return m_active_count; }
@@ -159,25 +86,24 @@ public:
         return m_active_slots[active_index];
     }
 
-    // Allocates a stable chunk slot in-place
     [[nodiscard]] u32 allocate(const glm::ivec3& coord)
     {
         assert(m_free_count > 0u && "ChunkPool capacity exceeded");
 
         const u32 slot = m_free_slots[--m_free_count];
 
-        // On-demand chunk allocation
-        if (!m_chunks[slot]) m_chunks[slot] = std::make_unique<Chunk>();
+        if (!m_chunks[slot]) m_chunks[slot] = std::make_unique<ChunkType>();
+        if (slot >= m_meshes.size()) m_meshes.resize(static_cast<usize>(slot) + 1u);
 
-        Chunk& chunk = *m_chunks[slot];
+        ChunkType& chunk = *m_chunks[slot];
         chunk.coord = coord;
         chunk.mesh_dirty = true;
 
         ChunkMesh& mesh = m_meshes[slot];
         mesh.coord = coord;
+        mesh.meshed_once = false;
         mesh.clear();
 
-        // Register in dense active slots list
         const u32 active_idx = m_active_count++;
         m_active_slots[active_idx] = slot;
         m_slot_to_active[slot] = active_idx;
@@ -191,14 +117,12 @@ public:
         const u32 active_idx = m_slot_to_active[slot];
         if (active_idx == INVALID_POOL_INDEX) return;
 
-        // Destroy GPU resources and clear CPU vertex cache
-        m_meshes[slot].destroy_gpu_resources(ctx);
-        m_meshes[slot].clear();
+        if (slot < m_meshes.size())
+        {
+            m_meshes[slot].destroy_gpu_resources(ctx);
+            m_meshes[slot].clear();
+        }
 
-        // Release the chunk heap memory to reduce RAM usage
-        m_chunks[slot].reset();
-
-        // Dense active list removal
         const u32 last_idx = --m_active_count;
         if (active_idx != last_idx)
         {
@@ -211,196 +135,16 @@ public:
         m_free_slots[m_free_count++] = slot;
     }
 
-    void trim()
-    {
-        for (u32 i = 0; i < m_free_count; ++i)
-        {
-            const u32 slot = m_free_slots[i];
-            if (m_chunks[slot]) m_chunks[slot].reset();
-            m_meshes[slot].clear();
-        }
-    }
-
-    [[nodiscard]] Chunk& chunk_at(u32 slot) { return *m_chunks[slot]; }
-    [[nodiscard]] const Chunk& chunk_at(u32 slot) const { return *m_chunks[slot]; }
+    [[nodiscard]] ChunkType& chunk_at(u32 slot) { return *m_chunks[slot]; }
+    [[nodiscard]] const ChunkType& chunk_at(u32 slot) const { return *m_chunks[slot]; }
 
     [[nodiscard]] ChunkMesh& mesh_at(u32 slot) { return m_meshes[slot]; }
     [[nodiscard]] const ChunkMesh& mesh_at(u32 slot) const { return m_meshes[slot]; }
 
-    struct ActiveChunkRef
-    {
-        Chunk& chunk;
-        ChunkMesh& mesh;
-    };
-
-    struct ConstActiveChunkRef
-    {
-        const Chunk& chunk;
-        const ChunkMesh& mesh;
-    };
-
-    struct ActiveIterator
-    {
-        using iterator_category = std::forward_iterator_tag;
-        using value_type = ActiveChunkRef;
-        using difference_type = std::ptrdiff_t;
-
-        ChunkPool* pool = nullptr;
-        u32 index = 0;
-
-        bool operator==(const ActiveIterator& other) const { return index == other.index; }
-        bool operator!=(const ActiveIterator& other) const { return index != other.index; }
-
-        ActiveIterator& operator++()
-        {
-            ++index;
-            return *this;
-        }
-        ActiveIterator operator++(int)
-        {
-            auto tmp = *this;
-            ++index;
-            return tmp;
-        }
-
-        ActiveChunkRef operator*() const
-        {
-            const u32 slot = pool->m_active_slots[index];
-            return {*pool->m_chunks[slot], pool->m_meshes[slot]};
-        }
-    };
-
-    struct ConstActiveIterator
-    {
-        using iterator_category = std::forward_iterator_tag;
-        using value_type = ConstActiveChunkRef;
-        using difference_type = std::ptrdiff_t;
-
-        const ChunkPool* pool = nullptr;
-        u32 index = 0;
-
-        bool operator==(const ConstActiveIterator& other) const { return index == other.index; }
-        bool operator!=(const ConstActiveIterator& other) const { return index != other.index; }
-
-        ConstActiveIterator& operator++()
-        {
-            ++index;
-            return *this;
-        }
-        ConstActiveIterator operator++(int)
-        {
-            auto tmp = *this;
-            ++index;
-            return tmp;
-        }
-
-        ConstActiveChunkRef operator*() const
-        {
-            const u32 slot = pool->m_active_slots[index];
-            return {*pool->m_chunks[slot], pool->m_meshes[slot]};
-        }
-    };
-
-    struct ActiveRange
-    {
-        ChunkPool* pool = nullptr;
-        ActiveIterator begin() const { return {pool, 0}; }
-        ActiveIterator end() const { return {pool, pool->m_active_count}; }
-    };
-
-    struct ConstActiveRange
-    {
-        const ChunkPool* pool = nullptr;
-        ConstActiveIterator begin() const { return {pool, 0}; }
-        ConstActiveIterator end() const { return {pool, pool->m_active_count}; }
-    };
-
-    [[nodiscard]] ActiveRange zipped() { return {this}; }
-    [[nodiscard]] ConstActiveRange zipped() const { return {this}; }
-
-    struct ActiveMeshIterator
-    {
-        using iterator_category = std::forward_iterator_tag;
-        using value_type = ChunkMesh;
-        using difference_type = std::ptrdiff_t;
-
-        ChunkPool* pool = nullptr;
-        u32 index = 0;
-
-        bool operator==(const ActiveMeshIterator& other) const { return index == other.index; }
-        bool operator!=(const ActiveMeshIterator& other) const { return index != other.index; }
-
-        ActiveMeshIterator& operator++()
-        {
-            ++index;
-            return *this;
-        }
-        ActiveMeshIterator operator++(int)
-        {
-            auto tmp = *this;
-            ++index;
-            return tmp;
-        }
-
-        ChunkMesh& operator*() const
-        {
-            const u32 slot = pool->m_active_slots[index];
-            return pool->m_meshes[slot];
-        }
-    };
-
-    struct ConstActiveMeshIterator
-    {
-        using iterator_category = std::forward_iterator_tag;
-        using value_type = const ChunkMesh;
-        using difference_type = std::ptrdiff_t;
-
-        const ChunkPool* pool = nullptr;
-        u32 index = 0;
-
-        bool operator==(const ConstActiveMeshIterator& other) const { return index == other.index; }
-        bool operator!=(const ConstActiveMeshIterator& other) const { return index != other.index; }
-
-        ConstActiveMeshIterator& operator++()
-        {
-            ++index;
-            return *this;
-        }
-        ConstActiveMeshIterator operator++(int)
-        {
-            auto tmp = *this;
-            ++index;
-            return tmp;
-        }
-
-        const ChunkMesh& operator*() const
-        {
-            const u32 slot = pool->m_active_slots[index];
-            return pool->m_meshes[slot];
-        }
-    };
-
-    struct ActiveMeshRange
-    {
-        ChunkPool* pool = nullptr;
-        ActiveMeshIterator begin() const { return {pool, 0}; }
-        ActiveMeshIterator end() const { return {pool, pool->m_active_count}; }
-    };
-
-    struct ConstActiveMeshRange
-    {
-        const ChunkPool* pool = nullptr;
-        ConstActiveMeshIterator begin() const { return {pool, 0}; }
-        ConstActiveMeshIterator end() const { return {pool, pool->m_active_count}; }
-    };
-
-    [[nodiscard]] ActiveMeshRange active_meshes() { return {this}; }
-    [[nodiscard]] ConstActiveMeshRange active_meshes() const { return {this}; }
-
 private:
 
-    std::vector<std::unique_ptr<Chunk>> m_chunks;
-    std::unique_ptr<ChunkMesh[]> m_meshes;
+    std::vector<std::unique_ptr<ChunkType>> m_chunks;
+    std::vector<ChunkMesh> m_meshes;
 
     std::unique_ptr<u32[]> m_active_slots;
     std::unique_ptr<u32[]> m_slot_to_active;
@@ -408,6 +152,97 @@ private:
 
     u32 m_active_count = 0;
     u32 m_free_count = 0;
+};
+
+class LodPoolGroup
+{
+public:
+
+    template <u32 Lod>
+        requires(Lod >= 1 && Lod <= MAX_LOD)
+    [[nodiscard]] auto& pool()
+    {
+        return std::get<Lod - 1u>(m_pools);
+    }
+
+    template <u32 Lod>
+        requires(Lod >= 1 && Lod <= MAX_LOD)
+    [[nodiscard]] const auto& pool() const
+    {
+        return std::get<Lod - 1u>(m_pools);
+    }
+
+    template <typename Fn>
+    decltype(auto) visit_lod(u8 lod, Fn&& fn)
+    {
+        switch (lod)
+        {
+            case 1: return fn(pool<1>());
+            case 2: return fn(pool<2>());
+            case 3: return fn(pool<3>());
+            case 4: return fn(pool<4>());
+            default: return fn(pool<5>());
+        }
+    }
+
+    template <typename Fn>
+    decltype(auto) visit_lod(u8 lod, Fn&& fn) const
+    {
+        switch (lod)
+        {
+            case 1: return fn(pool<1>());
+            case 2: return fn(pool<2>());
+            case 3: return fn(pool<3>());
+            case 4: return fn(pool<4>());
+            default: return fn(pool<5>());
+        }
+    }
+
+    template <typename Fn>
+    void for_each_pool(Fn&& fn)
+    {
+        std::apply([&](auto&... pools) { (fn(pools), ...); }, m_pools);
+    }
+
+    template <typename Fn>
+    void for_each_pool(Fn&& fn) const
+    {
+        std::apply([&](const auto&... pools) { (fn(pools), ...); }, m_pools);
+    }
+
+    [[nodiscard]] u32 total_active_chunks() const
+    {
+        u32 total = 0;
+        for_each_pool([&](const auto& p) { total += p.size(); });
+        return total;
+    }
+
+    [[nodiscard]] static constexpr u32 total_capacity()
+    {
+        return compute_lod_pool_capacity<1>() + compute_lod_pool_capacity<2>() + compute_lod_pool_capacity<3>() +
+               compute_lod_pool_capacity<4>() + compute_lod_pool_capacity<5>();
+    }
+
+    template <typename Fn>
+    void for_each_active_mesh(Fn&& fn) const
+    {
+        for_each_pool([&](const auto& p) {
+            const u32 count = p.size();
+            for (u32 i = 0; i < count; ++i) fn(p.mesh_at(p.active_slot(i)));
+        });
+    }
+
+    void destroy_all_gpu_resources(vulk::VulkanContext& ctx)
+    {
+        for_each_pool([&](auto& p) {
+            const u32 count = p.size();
+            for (u32 i = 0; i < count; ++i) p.mesh_at(p.active_slot(i)).destroy_gpu_resources(ctx);
+        });
+    }
+
+private:
+
+    std::tuple<ChunkPool<1>, ChunkPool<2>, ChunkPool<3>, ChunkPool<4>, ChunkPool<5>> m_pools {};
 };
 
 } // namespace vl

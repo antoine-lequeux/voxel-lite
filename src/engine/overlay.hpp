@@ -203,6 +203,13 @@ public:
 
     void draw(f32 dt, WorldManager& world, Camera& camera, vulk::VulkanContext& vulkan)
     {
+        m_gpu_stats_timer += dt;
+        if (m_gpu_stats_timer >= 0.35f || m_cached_gpu_stats.allocated_bytes == 0u)
+        {
+            m_gpu_stats_timer = 0.0f;
+            m_cached_gpu_stats = vulkan.get_memory_stats();
+        }
+
         const f32 gpu_ms = vulkan.get_gpu_render_time_ms();
         OverlayContext ctx {
             .dt = dt,
@@ -290,8 +297,8 @@ private:
         });
 
         // Hardware metrics: CPU, GPU, RAM
-        add_widget("hardware", "SYSTEM USAGE", [](OverlayContext& ctx) {
-            const auto gpu_stats = ctx.vulkan.get_memory_stats();
+        add_widget("hardware", "SYSTEM USAGE", [this](OverlayContext& ctx) {
+            const auto& gpu_stats = m_cached_gpu_stats;
             const f64 vram_used_mb = static_cast<f64>(gpu_stats.used_bytes) / (1024.0 * 1024.0);
             const f64 vram_alloc_mb = static_cast<f64>(gpu_stats.allocated_bytes) / (1024.0 * 1024.0);
             const std::string_view gpu_name = ctx.vulkan.get_gpu_name();
@@ -333,6 +340,10 @@ private:
             ImGui::Text("Chunks: %u drawn | %u culled", ctx.chunks_drawn, ctx.chunks_culled);
             ImGui::TextDisabled("Loaded: %u / %u", loaded_chunks, max_chunks);
             ImGui::TextDisabled(
+                "LODs: %u | %u | %u | %u | %u", ctx.world.get_lod_chunks_count<1>(), ctx.world.get_lod_chunks_count<2>(),
+                ctx.world.get_lod_chunks_count<3>(), ctx.world.get_lod_chunks_count<4>(), ctx.world.get_lod_chunks_count<5>()
+            );
+            ImGui::TextDisabled(
                 "Air: %u | Pending gen: %u", ctx.world.get_air_chunks_count(), ctx.world.get_pending_generation_count()
             );
             ImGui::TextDisabled("Far Plane: %.0f m", static_cast<f64>(ctx.camera.far_plane));
@@ -361,6 +372,8 @@ private:
     std::vector<OverlayWidget> m_widgets;
     FpsTracker m_fps;
     SystemMetrics m_metrics;
+    vulk::GpuMemoryStats m_cached_gpu_stats {};
+    f32 m_gpu_stats_timer = 0.35f;
 };
 
 } // namespace vl

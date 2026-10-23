@@ -10,6 +10,8 @@ constexpr i32 CHUNK_SIZE = 32;
 constexpr i32 CHUNK_AREA = CHUNK_SIZE * CHUNK_SIZE;
 constexpr i32 CHUNK_VOLUME = CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE;
 
+constexpr u32 MAX_LOD = 5;
+
 // Bit layout:
 //   Bits  0..5  (6 bits) -> Local X position [0..32]
 //   Bits  6..11 (6 bits) -> Local Y position [0..32]
@@ -31,9 +33,12 @@ struct ChunkMesh
     glm::ivec3 coord {0, 0, 0};
     std::vector<PackedVertex> vertices {};
     u32 quad_count = 0;
+    bool meshed_once = false;
 
     // GPU storage buffer for vertex pulling
     vulk::BufferHandle vertex_buffer {};
+    u64 device_address = 0;
+    u64 buffer_capacity_bytes = 0;
 
     [[nodiscard]] constexpr u32 index_count() const { return quad_count * 6u; }
     [[nodiscard]] constexpr bool empty() const { return quad_count == 0u; }
@@ -49,8 +54,22 @@ struct ChunkMesh
     void clear()
     {
         vertices.clear();
-        vertices.shrink_to_fit();
         quad_count = 0;
+    }
+
+    // Transfers ownership of an existing GPU vertex buffer so a chunk changing LOD continues rendering
+    // its previous mesh until its replacement mesh is uploaded
+    void inherit_gpu_resources(ChunkMesh& donor)
+    {
+        vertex_buffer = donor.vertex_buffer;
+        device_address = donor.device_address;
+        buffer_capacity_bytes = donor.buffer_capacity_bytes;
+        quad_count = donor.quad_count;
+        meshed_once = donor.meshed_once;
+        donor.vertex_buffer = {};
+        donor.device_address = 0;
+        donor.buffer_capacity_bytes = 0;
+        donor.quad_count = 0;
     }
 
     // Uploads the generated PackedVertex array to VRAM and ensures the shared quad index buffer is large enough
@@ -58,22 +77,61 @@ struct ChunkMesh
     void destroy_gpu_resources(vulk::VulkanContext& ctx);
 };
 
+template <u32 Lod = 1>
+    requires(Lod >= 1 && Lod <= MAX_LOD)
 class Chunk;
 
-// Neighbor pointers for cross-chunk face culling
-struct ChunkNeighbors
+// View of an adjacent chunk for cross-chunk face culling
+struct NeighborChunk
 {
-    const Chunk* left = nullptr;  // -X
-    const Chunk* right = nullptr; // +X
-    const Chunk* down = nullptr;  // -Y
-    const Chunk* up = nullptr;    // +Y
-    const Chunk* back = nullptr;  // -Z
-    const Chunk* front = nullptr; // +Z
+    enum class Kind : u8
+    {
+        Air = 0,   // Air chunk
+        Solid = 1, // Ungenerated chunk (treated as opaque)
+        Real = 2,  // Loaded chunk
+    };
+
+    const void* chunk_ptr = nullptr;
+    Kind kind = Kind::Air;
+    u8 lod = 1;
+
+    [[nodiscard]] static constexpr NeighborChunk air() { return {}; }
+    [[nodiscard]] static constexpr NeighborChunk solid() { return {.chunk_ptr = nullptr, .kind = Kind::Solid, .lod = 1}; }
+
+    template <u32 Lod>
+    [[nodiscard]] static constexpr NeighborChunk from_chunk(const Chunk<Lod>& chunk)
+    {
+        return {.chunk_ptr = &chunk, .kind = Kind::Real, .lod = static_cast<u8>(Lod)};
+    }
+
+    [[nodiscard]] BlockID sample_meter(u32 x_m, u32 y_m, u32 z_m) const;
+
+    [[nodiscard]] bool
+    should_render_boundary_face(BlockID current, u8 self_lod, u32 x_m, u32 y_m, u32 z_m, u32 sx, u32 sy, u32 sz) const;
 };
 
-class alignas(64) Chunk
+// Neighbor references for cross-chunk face culling
+struct ChunkNeighbors
+{
+    NeighborChunk left {};  // -X
+    NeighborChunk right {}; // +X
+    NeighborChunk down {};  // -Y
+    NeighborChunk up {};    // +Y
+    NeighborChunk back {};  // -Z
+    NeighborChunk front {}; // +Z
+};
+
+template <u32 Lod>
+    requires(Lod >= 1 && Lod <= MAX_LOD)
+class Chunk
 {
 public:
+
+    static constexpr u32 LOD = Lod;
+    static constexpr u32 SCALE = 1u << (Lod - 1u);                         // Size of each macroblock in meters (1, 2, 4, 8, 16)
+    static constexpr u32 DIM = static_cast<u32>(CHUNK_SIZE) >> (Lod - 1u); // Macroblocks per axis (32, 16, 8, 4, 2)
+    static constexpr u32 AREA = DIM * DIM;
+    static constexpr u32 VOLUME = DIM * DIM * DIM;
 
     [[nodiscard]] constexpr glm::vec3 world_origin() const
     {
@@ -84,21 +142,27 @@ public:
         };
     }
 
-    [[nodiscard]] static constexpr u32 get_index(u32 x, u32 y, u32 z) { return x + (y * CHUNK_SIZE) + (z * CHUNK_AREA); }
+    [[nodiscard]] static constexpr u32 get_index(u32 x, u32 y, u32 z) { return x + (y * DIM) + (z * AREA); }
 
     [[nodiscard]] constexpr BlockID get_block_unchecked(u32 x, u32 y, u32 z) const { return m_blocks[get_index(x, y, z)]; }
 
     [[nodiscard]] constexpr BlockID get_block(u32 x, u32 y, u32 z) const
     {
-        if (x >= CHUNK_SIZE || y >= CHUNK_SIZE || z >= CHUNK_SIZE) return BlockType::Air;
+        if (x >= DIM || y >= DIM || z >= DIM) return BlockType::Air;
         return m_blocks[get_index(x, y, z)];
+    }
+
+    [[nodiscard]] constexpr BlockID get_block_at_meter(u32 x_m, u32 y_m, u32 z_m) const
+    {
+        constexpr u32 shift = Lod - 1u;
+        return get_block_unchecked(x_m >> shift, y_m >> shift, z_m >> shift);
     }
 
     constexpr void set_block_unchecked(u32 x, u32 y, u32 z, BlockID id) { m_blocks[get_index(x, y, z)] = id; }
 
     constexpr void set_block(u32 x, u32 y, u32 z, BlockID id)
     {
-        if (x >= CHUNK_SIZE || y >= CHUNK_SIZE || z >= CHUNK_SIZE) return;
+        if (x >= DIM || y >= DIM || z >= DIM) return;
 
         const u32 index = get_index(x, y, z);
         const BlockID old_id = m_blocks[index];
@@ -111,65 +175,58 @@ public:
 
         if (was_opaque != is_opaque)
         {
-            constexpr u32 last = CHUNK_SIZE - 1u;
+            constexpr u32 last = DIM - 1u;
 
             auto update_face = [&](Direction dir) {
                 if (!is_opaque)
-                {
-                    // A solid block became transparent
-                    m_portal_mask |= (1 << static_cast<u8>(dir));
-                }
+                    m_portal_mask |= static_cast<u8>(1u << static_cast<u8>(dir));
                 else
-                {
-                    // A hole was filled, so the portal may be closed
                     recalculate_single_face(dir);
-                }
             };
 
-            if (x == 0) update_face(Direction::Left);
+            if (x == 0u) update_face(Direction::Left);
             if (x == last) update_face(Direction::Right);
-            if (y == 0) update_face(Direction::Down);
+            if (y == 0u) update_face(Direction::Down);
             if (y == last) update_face(Direction::Up);
-            if (z == 0) update_face(Direction::Back);
+            if (z == 0u) update_face(Direction::Back);
             if (z == last) update_face(Direction::Front);
         }
     }
 
     constexpr void recalculate_single_face(Direction dir)
     {
-        m_portal_mask &= ~(1 << static_cast<u8>(dir));
-        constexpr u32 last = CHUNK_SIZE - 1u;
+        m_portal_mask &= static_cast<u8>(~(1u << static_cast<u8>(dir)));
+        constexpr u32 last = DIM - 1u;
 
         auto check_and_set = [&](u32 x, u32 y, u32 z) {
             if (!is_block_opaque(get_block_unchecked(x, y, z)))
             {
-                m_portal_mask |= (1 << static_cast<u8>(dir));
+                m_portal_mask |= static_cast<u8>(1u << static_cast<u8>(dir));
                 return true;
             }
             return false;
         };
 
-        // Scan the affected face
-        for (u32 a = 0; a < CHUNK_SIZE; ++a)
+        for (u32 a = 0; a < DIM; ++a)
         {
-            for (u32 b = 0; b < CHUNK_SIZE; ++b)
+            for (u32 b = 0; b < DIM; ++b)
             {
                 switch (dir)
                 {
                     case Direction::Left:
-                        if (check_and_set(0, a, b)) return;
+                        if (check_and_set(0u, a, b)) return;
                         break;
                     case Direction::Right:
                         if (check_and_set(last, a, b)) return;
                         break;
                     case Direction::Down:
-                        if (check_and_set(a, 0, b)) return;
+                        if (check_and_set(a, 0u, b)) return;
                         break;
                     case Direction::Up:
                         if (check_and_set(a, last, b)) return;
                         break;
                     case Direction::Back:
-                        if (check_and_set(a, b, 0)) return;
+                        if (check_and_set(a, b, 0u)) return;
                         break;
                     case Direction::Front:
                         if (check_and_set(a, b, last)) return;
@@ -181,24 +238,24 @@ public:
 
     [[nodiscard]] constexpr bool has_portal(Direction direction) const
     {
-        return (m_portal_mask & (1 << static_cast<u8>(direction))) != 0;
+        return (m_portal_mask & (1u << static_cast<u8>(direction))) != 0u;
     }
 
-    void recalculate_portal_mask()
+    constexpr void recalculate_portal_mask()
     {
         m_portal_mask = 0;
-        constexpr u32 last = CHUNK_SIZE - 1u;
+        constexpr u32 last = DIM - 1u;
 
         auto scan_face = [this](Direction dir, auto get_coords) {
-            for (u32 a = 0; a < CHUNK_SIZE; ++a)
+            for (u32 a = 0; a < DIM; ++a)
             {
-                for (u32 b = 0; b < CHUNK_SIZE; ++b)
+                for (u32 b = 0; b < DIM; ++b)
                 {
                     const auto [x, y, z] = get_coords(a, b);
                     if (!is_block_opaque(get_block_unchecked(x, y, z)))
                     {
-                        m_portal_mask |= (1 << static_cast<u8>(dir));
-                        return; // Found a hole
+                        m_portal_mask |= static_cast<u8>(1u << static_cast<u8>(dir));
+                        return;
                     }
                 }
             }
@@ -226,7 +283,7 @@ public:
 
     [[nodiscard]] BlockID sample_block(i32 x, i32 y, i32 z, const ChunkNeighbors& neighbors = {}) const;
 
-    // Generates the visible surface mesh
+    // Generates the visible surface mesh scaled to match the physical chunk size
     void generate_mesh(ChunkMesh& out_mesh, const ChunkNeighbors& neighbors = {}) const;
 
     // Chunk position in chunk-grid coordinates
@@ -237,10 +294,9 @@ public:
 private:
 
     // 6 first bits: 1 if at least one non-opaque block for the corresponding face (L, R, D, U, B, F)
-    u8 m_portal_mask = 0b11111100;
+    u8 m_portal_mask = 0b00111111;
 
-    // Flat array for contiguous memory
-    std::array<BlockID, CHUNK_VOLUME> m_blocks {};
+    std::array<BlockID, VOLUME> m_blocks {};
 };
 
 } // namespace vl

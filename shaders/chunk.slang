@@ -32,6 +32,9 @@ static const float AO_CURVE[4] = {
     1.00  // unoccluded corner
 };
 
+// Distance threshold beyond which face textures are replaced by a unified face color
+static const float TEXTURE_CUTOFF_DIST = 128.0;
+
 struct VSOutput
 {
     float4 position                 : SV_Position;
@@ -80,27 +83,37 @@ VSOutput vertexMain(uint vertex_id : SV_VertexID)
 [shader("fragment")]
 float4 fragmentMain(VSOutput input) : SV_Target0
 {
-    // 16x16 checkerboard pattern on each face
-    float2 texel_coord = floor(clamp(input.uv, 0.0, 0.9999) * 16.0);
-    float  checker     = fmod(texel_coord.x + texel_coord.y, 2.0);
+    // Distance from camera to chunk center
+    float3 chunk_center = pc.chunk_origin_and_time.xyz + float3(16.0, 16.0, 16.0);
+    float  chunk_dist   = length(chunk_center - pc.camera_pos.xyz);
 
-    // Cutout blocks
-    if (input.visibility == 1u && checker < 0.5)
+    // Unified face color
+    float3 base_color = input.color;
+
+    if (chunk_dist < TEXTURE_CUTOFF_DIST)
     {
-        discard;
+        // 16x16 checkerboard pattern on each face
+        float2 texel_coord = floor(clamp(input.uv, 0.0, 0.9999) * 16.0);
+        float  checker     = fmod(texel_coord.x + texel_coord.y, 2.0);
+
+        // Cutout blocks
+        if (input.visibility == 1u && checker < 0.5)
+        {
+            discard;
+        }
+
+        float  texel_tint = lerp(0.96, 1.04, checker);
+        float2 edge_dist  = min(input.uv, 1.0 - input.uv);
+        float  border     = smoothstep(0.0, 0.035, min(edge_dist.x, edge_dist.y));
+        float  edge_shade = lerp(0.86, 1.0, border);
+
+        base_color *= (texel_tint * edge_shade);
     }
 
     float3 N = normalize(input.normal);
     float3 L = normalize(float3(0.42, 0.84, 0.36));
     float3 V = normalize(pc.camera_pos.xyz - input.world_pos);
     float3 H = normalize(L + V);
-
-    float  texel_tint  = lerp(0.96, 1.04, checker);
-
-    // Voxel border contour
-    float2 edge_dist  = min(input.uv, 1.0 - input.uv);
-    float  border     = smoothstep(0.0, 0.035, min(edge_dist.x, edge_dist.y));
-    float  edge_shade = lerp(0.86, 1.0, border);
 
     // Directional sun and ambient lighting
     float  ndotl    = max(dot(N, L), 0.0);
@@ -112,7 +125,6 @@ float4 fragmentMain(VSOutput input) : SV_Target0
     float spec_strength = lerp(0.45, 0.04, input.roughness);
     float spec          = pow(max(dot(N, H), 0.0), shininess) * spec_strength * ndotl;
 
-    float3 base_color = input.color * texel_tint * edge_shade;
     float3 direct_lit = (ambient + ndotl * float3(1.00, 0.96, 0.88)) * input.ao;
     float3 emissive   = base_color * (input.emission * 1.6);
 

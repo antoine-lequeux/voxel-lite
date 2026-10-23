@@ -54,9 +54,14 @@ bool Engine::init()
     ctx_config.app_version_major = AppConfig::VERSION_MAJOR;
     ctx_config.app_version_minor = AppConfig::VERSION_MINOR;
     ctx_config.app_version_patch = AppConfig::VERSION_PATCH;
+#if defined(NDEBUG)
+    ctx_config.enable_validation = false;
+#else
     ctx_config.enable_validation = true;
+#endif
     ctx_config.vsync = false;
     ctx_config.frames_in_flight = 2;
+    ctx_config.staging_buffer_size = 48ull * 1024ull * 1024ull;
 
     if (!m_vulkan_context.init(m_window, ctx_config))
     {
@@ -227,10 +232,9 @@ void Engine::render()
     u32 chunks_drawn = 0;
     u32 chunks_culled = 0;
 
-    // Render active chunks
-    for (const auto& mesh : m_manager->get_active_meshes())
-    {
-        if (mesh.empty() || !mesh.vertex_buffer.is_valid()) continue;
+    // Render active chunks across all LOD pools
+    m_manager->for_each_active_mesh([&](const ChunkMesh& mesh) {
+        if (mesh.empty() || mesh.device_address == 0u) return;
 
         const glm::vec3 origin = mesh.world_origin();
         constexpr glm::vec3 chunk_dims {static_cast<f32>(CHUNK_SIZE)};
@@ -239,20 +243,20 @@ void Engine::render()
         if (m_overlay.frustum_culling_enabled && !frustum.intersects_aabb(origin, origin + chunk_dims))
         {
             ++chunks_culled;
-            continue;
+            return;
         }
 
         ChunkPushConstants pc {};
         pc.mvp = vp;
         pc.chunk_origin_and_time = glm::vec4 {origin, m_elapsed_time};
         pc.camera_pos = cam_pos;
-        pc.vertex_buffer_address = m_vulkan_context.get_buffer_device_address(mesh.vertex_buffer);
+        pc.vertex_buffer_address = mesh.device_address;
         pc.material_buffer_address = material_addr;
 
         m_vulkan_context.push_constants(pc);
         m_vulkan_context.draw_indexed(mesh.index_count());
         ++chunks_drawn;
-    }
+    });
 
     m_overlay.set_chunk_culling_stats(chunks_drawn, chunks_culled);
 
@@ -313,7 +317,7 @@ void Engine::shutdown()
     m_vulkan_context.wait_idle();
     m_vulkan_context.shutdown_imgui();
 
-    for (const auto& [_, mesh] : m_manager->get_active_chunks()) mesh.destroy_gpu_resources(m_vulkan_context);
+    m_manager->destroy_all_gpu_resources(m_vulkan_context);
 
     if (m_block_material_buffer.is_valid()) m_vulkan_context.destroy_buffer(m_block_material_buffer);
     if (m_chunk_pipeline.is_valid()) m_vulkan_context.destroy_pipeline(m_chunk_pipeline);

@@ -60,8 +60,10 @@ inline constexpr std::array<std::array<FaceCornerOffset, 4>, 6> FACE_CORNERS {{
 }};
 
 // Computes voxel corner Ambient Occlusion level [0..3]
+template <u32 Lod>
 [[nodiscard]] u32 compute_corner_ao(
-    const Chunk& chunk, const ChunkNeighbors& neighbors, i32 bx, i32 by, i32 bz, Direction dir, const FaceCornerOffset& corner
+    const Chunk<Lod>& chunk, const ChunkNeighbors& neighbors, i32 bx, i32 by, i32 bz, Direction dir,
+    const FaceCornerOffset& corner
 )
 {
     const i32 sx = (corner.dx == 0u) ? -1 : 1;
@@ -111,10 +113,13 @@ inline constexpr std::array<std::array<FaceCornerOffset, 4>, 6> FACE_CORNERS {{
     return 3u - (s1 + s2 + c);
 }
 
+template <u32 Lod>
 void emit_face(
-    ChunkMesh& out_mesh, const Chunk& chunk, const ChunkNeighbors& neighbors, u32 x, u32 y, u32 z, Direction dir, BlockID block_id
+    ChunkMesh& out_mesh, const Chunk<Lod>& chunk, const ChunkNeighbors& neighbors, u32 x, u32 y, u32 z, Direction dir,
+    BlockID block_id
 )
 {
+    constexpr u32 scale = Chunk<Lod>::SCALE;
     const auto& corners = FACE_CORNERS[static_cast<usize>(dir)];
     const i32 bx = static_cast<i32>(x);
     const i32 by = static_cast<i32>(y);
@@ -127,7 +132,7 @@ void emit_face(
     {
         const FaceCornerOffset& c = corners[i];
         ao[i] = compute_corner_ao(chunk, neighbors, bx, by, bz, dir, c);
-        quad_verts[i] = pack_vertex(x + c.dx, y + c.dy, z + c.dz, dir, ao[i], c.uv_id, block_id);
+        quad_verts[i] = pack_vertex((x + c.dx) * scale, (y + c.dy) * scale, (z + c.dz) * scale, dir, ao[i], c.uv_id, block_id);
     }
 
     // Flip the quad's triangle split diagonal when AO is anisotropic to prevent interpolation artifacts
@@ -153,18 +158,40 @@ void emit_face(
 
 bool ChunkMesh::upload_to_gpu(vulk::VulkanContext& ctx)
 {
+    if (vertices.empty() || quad_count == 0u)
+    {
+        destroy_gpu_resources(ctx);
+        return true;
+    }
+
+    const u64 required_bytes = vertices.size() * sizeof(PackedVertex);
+
+    // Reuse the existing GPU buffer when remeshing if it is already large enough
+    if (vertex_buffer.is_valid() && buffer_capacity_bytes >= required_bytes)
+    {
+        ctx.upload_buffer_data(vertex_buffer, 0, vertices.data(), static_cast<usize>(required_bytes));
+        const vulk::BufferHandle quad_ibo = ctx.get_or_create_quad_index_buffer(quad_count);
+        return quad_ibo.is_valid();
+    }
+
     if (vertex_buffer.is_valid())
     {
         ctx.destroy_buffer(vertex_buffer);
         vertex_buffer = {};
+        device_address = 0;
+        buffer_capacity_bytes = 0;
     }
 
-    if (vertices.empty() || quad_count == 0u) return true;
-
     vertex_buffer = ctx.create_buffer(
-        vertices.size() * sizeof(PackedVertex), vulk::BufferUsage::Storage | vulk::BufferUsage::ShaderDeviceAddress,
-        vulk::MemoryUsage::GpuOnly, vertices.data()
+        required_bytes, vulk::BufferUsage::Storage | vulk::BufferUsage::ShaderDeviceAddress, vulk::MemoryUsage::GpuOnly,
+        vertices.data()
     );
+
+    if (vertex_buffer.is_valid())
+    {
+        device_address = ctx.get_buffer_device_address(vertex_buffer);
+        buffer_capacity_bytes = required_bytes;
+    }
 
     const vulk::BufferHandle quad_ibo = ctx.get_or_create_quad_index_buffer(quad_count);
     return vertex_buffer.is_valid() && quad_ibo.is_valid();
@@ -176,102 +203,165 @@ void ChunkMesh::destroy_gpu_resources(vulk::VulkanContext& ctx)
     {
         ctx.destroy_buffer(vertex_buffer);
         vertex_buffer = {};
+        device_address = 0;
+        buffer_capacity_bytes = 0;
     }
 }
 
-BlockID Chunk::sample_block(i32 x, i32 y, i32 z, const ChunkNeighbors& neighbors) const
+BlockID NeighborChunk::sample_meter(u32 x_m, u32 y_m, u32 z_m) const
+{
+    if (kind == Kind::Air) return BlockType::Air;
+    if (kind == Kind::Solid) return BlockType::Stone;
+
+    switch (lod)
+    {
+        case 1: return static_cast<const Chunk<1>*>(chunk_ptr)->get_block_at_meter(x_m, y_m, z_m);
+        case 2: return static_cast<const Chunk<2>*>(chunk_ptr)->get_block_at_meter(x_m, y_m, z_m);
+        case 3: return static_cast<const Chunk<3>*>(chunk_ptr)->get_block_at_meter(x_m, y_m, z_m);
+        case 4: return static_cast<const Chunk<4>*>(chunk_ptr)->get_block_at_meter(x_m, y_m, z_m);
+        case 5: return static_cast<const Chunk<5>*>(chunk_ptr)->get_block_at_meter(x_m, y_m, z_m);
+        default: return BlockType::Air;
+    }
+}
+
+bool NeighborChunk::should_render_boundary_face(
+    BlockID current, u8 self_lod, u32 x_m, u32 y_m, u32 z_m, u32 sx, u32 sy, u32 sz
+) const
+{
+    if (kind == Kind::Air) return should_render_face(current, BlockType::Air);
+    if (kind == Kind::Solid) return false;
+
+    // Neighbor macroblocks are the same size or larger than ours, so a single sample covers the entire face
+    if (lod >= self_lod) return should_render_face(current, sample_meter(x_m, y_m, z_m));
+
+    // Neighbor has smaller blocks, so we emit the face if it's not entirely covered
+    const u32 step = 1u << (lod - 1u);
+    const u32 step_x = std::min(step, sx);
+    const u32 step_y = std::min(step, sy);
+    const u32 step_z = std::min(step, sz);
+
+    for (u32 dz = 0; dz < sz; dz += step_z)
+    {
+        for (u32 dy = 0; dy < sy; dy += step_y)
+        {
+            for (u32 dx = 0; dx < sx; dx += step_x)
+                if (should_render_face(current, sample_meter(x_m + dx, y_m + dy, z_m + dz))) return true;
+        }
+    }
+
+    return false;
+}
+
+template <u32 Lod>
+    requires(Lod >= 1 && Lod <= MAX_LOD)
+BlockID Chunk<Lod>::sample_block(i32 x, i32 y, i32 z, const ChunkNeighbors& neighbors) const
 {
     // Inside current chunk
-    if (static_cast<u32>(x) < CHUNK_SIZE && static_cast<u32>(y) < CHUNK_SIZE && static_cast<u32>(z) < CHUNK_SIZE)
+    if (static_cast<u32>(x) < DIM && static_cast<u32>(y) < DIM && static_cast<u32>(z) < DIM)
         return get_block_unchecked(static_cast<u32>(x), static_cast<u32>(y), static_cast<u32>(z));
 
-    // Cross-chunk
-    if (static_cast<u32>(y) < CHUNK_SIZE && static_cast<u32>(z) < CHUNK_SIZE)
+    constexpr u32 last_meter = static_cast<u32>(CHUNK_SIZE) - 1u;
+
+    // Cross-chunk in meter coordinates
+    if (static_cast<u32>(y) < DIM && static_cast<u32>(z) < DIM)
     {
-        if (x < 0 && neighbors.left != nullptr)
-            return neighbors.left->get_block(static_cast<u32>(x + CHUNK_SIZE), static_cast<u32>(y), static_cast<u32>(z));
-        if (x >= CHUNK_SIZE && neighbors.right != nullptr)
-            return neighbors.right->get_block(static_cast<u32>(x - CHUNK_SIZE), static_cast<u32>(y), static_cast<u32>(z));
+        const u32 y_m = static_cast<u32>(y) * SCALE;
+        const u32 z_m = static_cast<u32>(z) * SCALE;
+        if (x < 0) return neighbors.left.sample_meter(last_meter, y_m, z_m);
+        if (static_cast<u32>(x) >= DIM) return neighbors.right.sample_meter(0u, y_m, z_m);
     }
-    if (static_cast<u32>(x) < CHUNK_SIZE && static_cast<u32>(z) < CHUNK_SIZE)
+    if (static_cast<u32>(x) < DIM && static_cast<u32>(z) < DIM)
     {
-        if (y < 0 && neighbors.down != nullptr)
-            return neighbors.down->get_block(static_cast<u32>(x), static_cast<u32>(y + CHUNK_SIZE), static_cast<u32>(z));
-        if (y >= CHUNK_SIZE && neighbors.up != nullptr)
-            return neighbors.up->get_block(static_cast<u32>(x), static_cast<u32>(y - CHUNK_SIZE), static_cast<u32>(z));
+        const u32 x_m = static_cast<u32>(x) * SCALE;
+        const u32 z_m = static_cast<u32>(z) * SCALE;
+        if (y < 0) return neighbors.down.sample_meter(x_m, last_meter, z_m);
+        if (static_cast<u32>(y) >= DIM) return neighbors.up.sample_meter(x_m, 0u, z_m);
     }
-    if (static_cast<u32>(x) < CHUNK_SIZE && static_cast<u32>(y) < CHUNK_SIZE)
+    if (static_cast<u32>(x) < DIM && static_cast<u32>(y) < DIM)
     {
-        if (z < 0 && neighbors.back != nullptr)
-            return neighbors.back->get_block(static_cast<u32>(x), static_cast<u32>(y), static_cast<u32>(z + CHUNK_SIZE));
-        if (z >= CHUNK_SIZE && neighbors.front != nullptr)
-            return neighbors.front->get_block(static_cast<u32>(x), static_cast<u32>(y), static_cast<u32>(z - CHUNK_SIZE));
+        const u32 x_m = static_cast<u32>(x) * SCALE;
+        const u32 y_m = static_cast<u32>(y) * SCALE;
+        if (z < 0) return neighbors.back.sample_meter(x_m, y_m, last_meter);
+        if (static_cast<u32>(z) >= DIM) return neighbors.front.sample_meter(x_m, y_m, 0u);
     }
 
     return BlockType::Air;
 }
 
-void Chunk::generate_mesh(ChunkMesh& out_mesh, const ChunkNeighbors& neighbors) const
+template <u32 Lod>
+    requires(Lod >= 1 && Lod <= MAX_LOD)
+void Chunk<Lod>::generate_mesh(ChunkMesh& out_mesh, const ChunkNeighbors& neighbors) const
 {
     out_mesh.clear();
     out_mesh.coord = coord;
 
-    if (out_mesh.vertices.capacity() < 16384u) out_mesh.vertices.reserve(16384u);
+    constexpr u32 reserve_verts = std::max(64u, 16384u >> ((Lod - 1u) * 2u));
+    if (out_mesh.vertices.capacity() < reserve_verts) out_mesh.vertices.reserve(reserve_verts);
 
-    constexpr u32 last = CHUNK_SIZE - 1u;
+    constexpr u32 last = DIM - 1u;
+    constexpr u32 last_meter = static_cast<u32>(CHUNK_SIZE) - 1u;
+    constexpr u8 self_lod = static_cast<u8>(Lod);
 
-    for (u32 z = 0; z < CHUNK_SIZE; ++z)
+    for (u32 z = 0; z < DIM; ++z)
     {
-        for (u32 y = 0; y < CHUNK_SIZE; ++y)
+        const u32 z_m = z * SCALE;
+        for (u32 y = 0; y < DIM; ++y)
         {
-            for (u32 x = 0; x < CHUNK_SIZE; ++x)
+            const u32 y_m = y * SCALE;
+            for (u32 x = 0; x < DIM; ++x)
             {
                 const BlockID current = get_block_unchecked(x, y, z);
                 if (current == BlockType::Air) continue;
 
+                const u32 x_m = x * SCALE;
+
                 // Left (-X)
-                const BlockID left_block =
-                    (x > 0u) ? get_block_unchecked(x - 1u, y, z)
-                             : ((neighbors.left != nullptr) ? neighbors.left->get_block_unchecked(last, y, z) : BlockType::Air);
-                if (should_render_face(current, left_block))
-                    emit_face(out_mesh, *this, neighbors, x, y, z, Direction::Left, current);
+                const bool render_left =
+                    (x > 0u)
+                        ? should_render_face(current, get_block_unchecked(x - 1u, y, z))
+                        : neighbors.left.should_render_boundary_face(current, self_lod, last_meter, y_m, z_m, 1u, SCALE, SCALE);
+                if (render_left) emit_face(out_mesh, *this, neighbors, x, y, z, Direction::Left, current);
 
                 // Right (+X)
-                const BlockID right_block =
-                    (x < last) ? get_block_unchecked(x + 1u, y, z)
-                               : ((neighbors.right != nullptr) ? neighbors.right->get_block_unchecked(0u, y, z) : BlockType::Air);
-                if (should_render_face(current, right_block))
-                    emit_face(out_mesh, *this, neighbors, x, y, z, Direction::Right, current);
+                const bool render_right =
+                    (x < last) ? should_render_face(current, get_block_unchecked(x + 1u, y, z))
+                               : neighbors.right.should_render_boundary_face(current, self_lod, 0u, y_m, z_m, 1u, SCALE, SCALE);
+                if (render_right) emit_face(out_mesh, *this, neighbors, x, y, z, Direction::Right, current);
 
                 // Down (-Y)
-                const BlockID down_block =
-                    (y > 0u) ? get_block_unchecked(x, y - 1u, z)
-                             : ((neighbors.down != nullptr) ? neighbors.down->get_block_unchecked(x, last, z) : BlockType::Air);
-                if (should_render_face(current, down_block))
-                    emit_face(out_mesh, *this, neighbors, x, y, z, Direction::Down, current);
+                const bool render_down =
+                    (y > 0u)
+                        ? should_render_face(current, get_block_unchecked(x, y - 1u, z))
+                        : neighbors.down.should_render_boundary_face(current, self_lod, x_m, last_meter, z_m, SCALE, 1u, SCALE);
+                if (render_down) emit_face(out_mesh, *this, neighbors, x, y, z, Direction::Down, current);
 
                 // Up (+Y)
-                const BlockID up_block =
-                    (y < last) ? get_block_unchecked(x, y + 1u, z)
-                               : ((neighbors.up != nullptr) ? neighbors.up->get_block_unchecked(x, 0u, z) : BlockType::Air);
-                if (should_render_face(current, up_block)) emit_face(out_mesh, *this, neighbors, x, y, z, Direction::Up, current);
+                const bool render_up =
+                    (y < last) ? should_render_face(current, get_block_unchecked(x, y + 1u, z))
+                               : neighbors.up.should_render_boundary_face(current, self_lod, x_m, 0u, z_m, SCALE, 1u, SCALE);
+                if (render_up) emit_face(out_mesh, *this, neighbors, x, y, z, Direction::Up, current);
 
                 // Back (-Z)
-                const BlockID back_block =
-                    (z > 0u) ? get_block_unchecked(x, y, z - 1u)
-                             : ((neighbors.back != nullptr) ? neighbors.back->get_block_unchecked(x, y, last) : BlockType::Air);
-                if (should_render_face(current, back_block))
-                    emit_face(out_mesh, *this, neighbors, x, y, z, Direction::Back, current);
+                const bool render_back =
+                    (z > 0u)
+                        ? should_render_face(current, get_block_unchecked(x, y, z - 1u))
+                        : neighbors.back.should_render_boundary_face(current, self_lod, x_m, y_m, last_meter, SCALE, SCALE, 1u);
+                if (render_back) emit_face(out_mesh, *this, neighbors, x, y, z, Direction::Back, current);
 
                 // Front (+Z)
-                const BlockID front_block =
-                    (z < last) ? get_block_unchecked(x, y, z + 1u)
-                               : ((neighbors.front != nullptr) ? neighbors.front->get_block_unchecked(x, y, 0u) : BlockType::Air);
-                if (should_render_face(current, front_block))
-                    emit_face(out_mesh, *this, neighbors, x, y, z, Direction::Front, current);
+                const bool render_front =
+                    (z < last) ? should_render_face(current, get_block_unchecked(x, y, z + 1u))
+                               : neighbors.front.should_render_boundary_face(current, self_lod, x_m, y_m, 0u, SCALE, SCALE, 1u);
+                if (render_front) emit_face(out_mesh, *this, neighbors, x, y, z, Direction::Front, current);
             }
         }
     }
 }
+
+template class Chunk<1>;
+template class Chunk<2>;
+template class Chunk<3>;
+template class Chunk<4>;
+template class Chunk<5>;
 
 } // namespace vl
