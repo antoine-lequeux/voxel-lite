@@ -1,5 +1,6 @@
 #include "worldmanager.hpp"
 
+#include <cstring>
 
 namespace vl
 {

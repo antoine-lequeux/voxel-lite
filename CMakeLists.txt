@@ -278,8 +278,11 @@ else()
     # Strip unused functions and data in Release builds
     if(UNIX)
         target_link_options(${PROJECT_NAME} PRIVATE $<$<CONFIG:Release>:-Wl,--gc-sections>)
-    elseif(WIN32)
-        target_link_options(${PROJECT_NAME} PRIVATE $<$<CONFIG:Release>:-Wl,/OPT:REF,/OPT:ICF>)
+    endif()
+
+    # Add some modern C++ features for GCC
+    if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+        target_link_libraries(${PROJECT_NAME} PRIVATE stdc++exp)
     endif()
 
     # Use LLD linker when compiling with Clang if available
