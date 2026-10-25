@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <glm/glm.hpp>
+#include <glm/gtc/matrix_access.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 
 namespace vl
@@ -91,10 +92,10 @@ struct Frustum
     [[nodiscard]] static Frustum from_view_projection(const glm::mat4& vp)
     {
         Frustum f {};
-        const glm::vec4 row0 {vp[0][0], vp[1][0], vp[2][0], vp[3][0]};
-        const glm::vec4 row1 {vp[0][1], vp[1][1], vp[2][1], vp[3][1]};
-        const glm::vec4 row2 {vp[0][2], vp[1][2], vp[2][2], vp[3][2]};
-        const glm::vec4 row3 {vp[0][3], vp[1][3], vp[2][3], vp[3][3]};
+        const glm::vec4 row0 = glm::row(vp, 0);
+        const glm::vec4 row1 = glm::row(vp, 1);
+        const glm::vec4 row2 = glm::row(vp, 2);
+        const glm::vec4 row3 = glm::row(vp, 3);
 
         f.planes[0] = row3 + row0; // Left
         f.planes[1] = row3 - row0; // Right
