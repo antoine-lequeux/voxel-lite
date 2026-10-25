@@ -111,21 +111,6 @@ struct Frustum
 
         return f;
     }
-
-    [[nodiscard]] bool intersects_aabb(const glm::vec3& min, const glm::vec3& max) const
-    {
-        for (const glm::vec4& plane : planes)
-        {
-            const glm::vec3 p {
-                (plane.x > 0.0f) ? max.x : min.x,
-                (plane.y > 0.0f) ? max.y : min.y,
-                (plane.z > 0.0f) ? max.z : min.z,
-            };
-
-            if (glm::dot(glm::vec3(plane), p) + plane.w < 0.0f) return false;
-        }
-        return true;
-    }
 };
 
 } // namespace vl
