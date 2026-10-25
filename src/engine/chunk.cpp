@@ -186,7 +186,7 @@ u32 ChunkDrawTable::update_slot(u32 current_slot, const glm::ivec3& coord, u32 q
     };
 
     GpuChunkDraw& dst = m_entries[slot];
-    if (dst.origin_and_quads != entry.origin_and_quads || dst.vertex_buffer_address != entry.vertex_buffer_address)
+    if (dst != entry)
     {
         dst = entry;
         mark_dirty(slot);

@@ -36,6 +36,12 @@ struct alignas(16) GpuChunkDraw
     glm::ivec4 origin_and_quads {0, 0, 0, 0}; // xyz = chunk world origin in blocks, w = quad_count (0 = empty)
     u64 vertex_buffer_address = 0;
     u64 reserved = 0;
+
+    constexpr bool operator==(const GpuChunkDraw& other) const
+    {
+        return origin_and_quads == other.origin_and_quads && vertex_buffer_address == other.vertex_buffer_address &&
+               reserved == other.reserved;
+    }
 };
 
 static_assert(sizeof(GpuChunkDraw) == 32);
