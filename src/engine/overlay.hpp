@@ -85,7 +85,10 @@ struct SystemMetrics
 private:
 
 #if defined(_WIN32)
-    static u64 filetime_to_u64(const FILETIME& ft) { return (static_cast<u64>(ft.dwHighDateTime) << 32) | ft.dwLowDateTime; }
+    [[nodiscard]] static constexpr u64 filetime_to_u64(const FILETIME& ft)
+    {
+        return (static_cast<u64>(ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
+    }
 #endif
 
     f32 m_sample_timer = 0.0f;
@@ -238,9 +241,8 @@ public:
 
         if (ImGui::Begin("##DebugOverlay", nullptr, flags))
         {
-            for (usize i = 0; i < m_widgets.size(); ++i)
+            for (auto& widget : m_widgets)
             {
-                auto& widget = m_widgets[i];
                 if (!widget.enabled || !widget.render_fn) continue;
 
                 if (!widget.title.empty())

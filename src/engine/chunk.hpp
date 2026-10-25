@@ -168,6 +168,20 @@ struct ChunkNeighbors
     NeighborChunk up {};    // +Y
     NeighborChunk back {};  // -Z
     NeighborChunk front {}; // +Z
+
+    [[nodiscard]] const NeighborChunk& get(Direction dir) const
+    {
+        switch (dir)
+        {
+            case Direction::Left: return left;
+            case Direction::Right: return right;
+            case Direction::Down: return down;
+            case Direction::Up: return up;
+            case Direction::Back: return back;
+            case Direction::Front: return front;
+        }
+        return left;
+    }
 };
 
 template <u32 Lod>

@@ -413,44 +413,36 @@ void Chunk<Lod>::generate_mesh(ChunkMesh& out_mesh, const ChunkNeighbors& neighb
 
                 const u32 x_m = x * SCALE;
 
-                // Left (-X)
-                const bool render_left =
-                    (x > 0u)
-                        ? should_render_face(current, get_block_unchecked(x - 1u, y, z))
-                        : neighbors.left.should_render_boundary_face(current, self_lod, last_meter, y_m, z_m, 1u, SCALE, SCALE);
-                if (render_left) emit_face(out_mesh, *this, neighbors, x, y, z, Direction::Left, current);
+                auto test_and_emit = [&](Direction dir, bool is_internal, auto get_neighbor, u32 bx, u32 by, u32 bz, u32 sx,
+                                         u32 sy, u32 sz) {
+                    const bool render =
+                        is_internal ? should_render_face(current, get_neighbor())
+                                    : neighbors.get(dir).should_render_boundary_face(current, self_lod, bx, by, bz, sx, sy, sz);
+                    if (render) emit_face(out_mesh, *this, neighbors, x, y, z, dir, current);
+                };
 
-                // Right (+X)
-                const bool render_right =
-                    (x < last) ? should_render_face(current, get_block_unchecked(x + 1u, y, z))
-                               : neighbors.right.should_render_boundary_face(current, self_lod, 0u, y_m, z_m, 1u, SCALE, SCALE);
-                if (render_right) emit_face(out_mesh, *this, neighbors, x, y, z, Direction::Right, current);
-
-                // Down (-Y)
-                const bool render_down =
-                    (y > 0u)
-                        ? should_render_face(current, get_block_unchecked(x, y - 1u, z))
-                        : neighbors.down.should_render_boundary_face(current, self_lod, x_m, last_meter, z_m, SCALE, 1u, SCALE);
-                if (render_down) emit_face(out_mesh, *this, neighbors, x, y, z, Direction::Down, current);
-
-                // Up (+Y)
-                const bool render_up =
-                    (y < last) ? should_render_face(current, get_block_unchecked(x, y + 1u, z))
-                               : neighbors.up.should_render_boundary_face(current, self_lod, x_m, 0u, z_m, SCALE, 1u, SCALE);
-                if (render_up) emit_face(out_mesh, *this, neighbors, x, y, z, Direction::Up, current);
-
-                // Back (-Z)
-                const bool render_back =
-                    (z > 0u)
-                        ? should_render_face(current, get_block_unchecked(x, y, z - 1u))
-                        : neighbors.back.should_render_boundary_face(current, self_lod, x_m, y_m, last_meter, SCALE, SCALE, 1u);
-                if (render_back) emit_face(out_mesh, *this, neighbors, x, y, z, Direction::Back, current);
-
-                // Front (+Z)
-                const bool render_front =
-                    (z < last) ? should_render_face(current, get_block_unchecked(x, y, z + 1u))
-                               : neighbors.front.should_render_boundary_face(current, self_lod, x_m, y_m, 0u, SCALE, SCALE, 1u);
-                if (render_front) emit_face(out_mesh, *this, neighbors, x, y, z, Direction::Front, current);
+                // Test and emit faces for all 6 directions
+                test_and_emit(
+                    Direction::Left, x > 0u, [&] { return get_block_unchecked(x - 1u, y, z); }, last_meter, y_m, z_m, 1u, SCALE,
+                    SCALE
+                );
+                test_and_emit(
+                    Direction::Right, x < last, [&] { return get_block_unchecked(x + 1u, y, z); }, 0u, y_m, z_m, 1u, SCALE, SCALE
+                );
+                test_and_emit(
+                    Direction::Down, y > 0u, [&] { return get_block_unchecked(x, y - 1u, z); }, x_m, last_meter, z_m, SCALE, 1u,
+                    SCALE
+                );
+                test_and_emit(
+                    Direction::Up, y < last, [&] { return get_block_unchecked(x, y + 1u, z); }, x_m, 0u, z_m, SCALE, 1u, SCALE
+                );
+                test_and_emit(
+                    Direction::Back, z > 0u, [&] { return get_block_unchecked(x, y, z - 1u); }, x_m, y_m, last_meter, SCALE,
+                    SCALE, 1u
+                );
+                test_and_emit(
+                    Direction::Front, z < last, [&] { return get_block_unchecked(x, y, z + 1u); }, x_m, y_m, 0u, SCALE, SCALE, 1u
+                );
             }
         }
     }
