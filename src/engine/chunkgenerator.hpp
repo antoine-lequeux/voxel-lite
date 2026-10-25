@@ -57,15 +57,15 @@ private:
     const ColumnInfo& compute_column(i32 cx, i32 cz, u8 lod);
     const ColumnInfo& get_column(i32 cx, i32 cz, u8 lod);
 
-    FastNoise::SmartNode<> m_node_graph;
-    std::vector<f32> m_noise_buffer;
-    std::vector<i32> m_heights;
-    std::vector<ColumnInfo> m_column_cache;
+    FastNoise::SmartNode<> m_node_graph {};
+    std::vector<f32> m_noise_buffer {};
+    std::vector<i32> m_heights {};
+    std::vector<ColumnInfo> m_column_cache {};
     i32 m_heights_cx = 0;
     i32 m_heights_cz = 0;
     u8 m_heights_lod = 0;
     bool m_heights_valid = false;
-    i32 m_seed;
+    i32 m_seed = 0;
 };
 
 } // namespace vl

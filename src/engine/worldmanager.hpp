@@ -339,19 +339,19 @@ private:
     void process_mesh_queues(vulk::VulkanContext& ctx);
 
     // Spatial grid (main thread)
-    std::unique_ptr<GridCell[]> m_grid;
-    std::unique_ptr<u16[]> m_cell_bfs_state;
+    std::unique_ptr<GridCell[]> m_grid {};
+    std::unique_ptr<u16[]> m_cell_bfs_state {};
     u32 m_current_epoch = 0;
     u32 m_frontier_stamp = 1;
     u32 m_air_chunks_count = 0;
 
     // Background BFS state (isolated from main thread)
     BackgroundBfsTask m_bfs_task;
-    std::unique_ptr<u16[]> m_bfs_snapshot;
-    std::unique_ptr<u64[]> m_bfs_visited_bits;
-    std::vector<SearchNode> m_bfs_queue;
-    std::vector<glm::ivec3> m_bfs_out_candidates;
-    std::vector<glm::ivec3> m_bfs_out_unwanted;
+    std::unique_ptr<u16[]> m_bfs_snapshot {};
+    std::unique_ptr<u64[]> m_bfs_visited_bits {};
+    std::vector<SearchNode> m_bfs_queue {};
+    std::vector<glm::ivec3> m_bfs_out_candidates {};
+    std::vector<glm::ivec3> m_bfs_out_unwanted {};
     glm::ivec3 m_bfs_origin {0, 0, 0};
     i32 m_bfs_rd = 0;
     u32 m_bfs_start_epoch = 0;
@@ -362,8 +362,8 @@ private:
     // Per-LOD generation and meshing queues (index 0 = LOD 1, index MAX_LOD-1 = LOD 5)
     std::deque<glm::ivec3> m_urgent_gen_queue {};
     std::array<std::deque<glm::ivec3>, MAX_LOD> m_gen_queues {};
-    std::vector<glm::ivec3> m_frontier_during_bfs;
-    std::vector<glm::ivec3> m_near_offsets;
+    std::vector<glm::ivec3> m_frontier_during_bfs {};
+    std::vector<glm::ivec3> m_near_offsets {};
     glm::ivec3 m_last_origin {0, 0, 0};
     i32 m_last_render_distance = 0;
     bool m_has_last_origin = false;
