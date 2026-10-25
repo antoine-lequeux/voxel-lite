@@ -1,4 +1,4 @@
-#include "engine/chunkgenerator.hpp"
+#include "chunkgenerator.hpp"
 #include "block.hpp"
 
 namespace vl

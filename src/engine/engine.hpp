@@ -1,7 +1,7 @@
 #pragma once
 
-#include "engine/overlay.hpp"
-#include "engine/worldmanager.hpp"
+#include "overlay.hpp"
+#include "worldmanager.hpp"
 
 struct SDL_Window;
 

@@ -1,7 +1,7 @@
 #pragma once
 
-#include "engine/camera.hpp"
-#include "engine/worldmanager.hpp"
+#include "camera.hpp"
+#include "worldmanager.hpp"
 
 #include <imgui.h>
 

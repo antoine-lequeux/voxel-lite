@@ -1,6 +1,6 @@
 #pragma once
 
-#include "engine/chunk.hpp"
+#include "chunk.hpp"
 
 #include <FastNoise/FastNoise.h>
 
