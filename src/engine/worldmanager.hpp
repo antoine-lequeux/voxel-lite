@@ -22,6 +22,15 @@ inline constexpr u32 MAX_GEN_BATCH_CHUNKS = 2048;
 inline constexpr u32 MAX_MESH_BATCH_CHUNKS = 2048;
 inline constexpr u64 MAX_UPLOAD_BYTES_PER_FRAME = 16ull * 2048 * 2048;
 
+[[nodiscard]] constexpr i32 length_squared(const glm::ivec3& v)
+{
+    return (v.x * v.x) + (v.y * v.y) + (v.z * v.z);
+}
+
+[[nodiscard]] constexpr i32 distance_squared(const glm::ivec3& a, const glm::ivec3& b)
+{
+    return length_squared(a - b);
+}
 class WorldManager
 {
 public:

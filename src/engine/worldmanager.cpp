@@ -45,10 +45,7 @@ WorldManager::WorldManager(i32 seed)
         for (i32 dz = -NEAR_RADIUS; dz <= NEAR_RADIUS; ++dz)
             for (i32 dx = -NEAR_RADIUS; dx <= NEAR_RADIUS; ++dx) m_near_offsets.emplace_back(dx, dy, dz);
 
-    auto len2 = [](const glm::ivec3& v) { return (v.x * v.x) + (v.y * v.y) + (v.z * v.z); };
-    std::stable_sort(m_near_offsets.begin(), m_near_offsets.end(), [&](const glm::ivec3& a, const glm::ivec3& b) {
-        return len2(a) < len2(b);
-    });
+    std::ranges::stable_sort(m_near_offsets, {}, length_squared);
 }
 
 WorldManager::~WorldManager()
@@ -261,15 +258,7 @@ void WorldManager::harvest_background_bfs(const glm::ivec3& origin, vulk::Vulkan
     }
 
     // Sort any frontier candidates discovered on the main thread while the BFS was running so closest come first
-    auto dist2 = [&](const glm::ivec3& c) -> i32 {
-        const i32 dx = c.x - origin.x;
-        const i32 dy = c.y - origin.y;
-        const i32 dz = c.z - origin.z;
-        return (dx * dx) + (dy * dy) + (dz * dz);
-    };
-    std::stable_sort(m_frontier_during_bfs.begin(), m_frontier_during_bfs.end(), [&](const glm::ivec3& a, const glm::ivec3& b) {
-        return dist2(a) < dist2(b);
-    });
+    std::ranges::stable_sort(m_frontier_during_bfs, {}, [&](const glm::ivec3& c) { return distance_squared(c, origin); });
 
     for (auto& q : m_gen_queues) q.clear();
     const u32 stamp = ++m_frontier_stamp;
@@ -413,15 +402,7 @@ void WorldManager::execute_background_bfs()
     }
 
     // Sort candidates closest first so near terrain and LOD transitions always complete before distant horizon chunks
-    auto dist2 = [&](const glm::ivec3& c) -> i32 {
-        const i32 dx = c.x - origin.x;
-        const i32 dy = c.y - origin.y;
-        const i32 dz = c.z - origin.z;
-        return (dx * dx) + (dy * dy) + (dz * dz);
-    };
-    std::stable_sort(m_bfs_out_candidates.begin(), m_bfs_out_candidates.end(), [&](const glm::ivec3& a, const glm::ivec3& b) {
-        return dist2(a) < dist2(b);
-    });
+    std::ranges::stable_sort(m_bfs_out_candidates, {}, [&](const glm::ivec3& c) { return distance_squared(c, origin); });
 }
 
 bool WorldManager::expand_frontier_from(

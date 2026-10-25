@@ -139,19 +139,9 @@ void emit_face(
 
     // Flip the quad's triangle split diagonal when AO is anisotropic to prevent interpolation artifacts
     if (ao[0] + ao[2] < ao[1] + ao[3])
-    {
-        out_mesh.vertices.push_back(quad_verts[1]);
-        out_mesh.vertices.push_back(quad_verts[2]);
-        out_mesh.vertices.push_back(quad_verts[3]);
-        out_mesh.vertices.push_back(quad_verts[0]);
-    }
+        out_mesh.vertices.append_range(std::array {quad_verts[1], quad_verts[2], quad_verts[3], quad_verts[0]});
     else
-    {
-        out_mesh.vertices.push_back(quad_verts[0]);
-        out_mesh.vertices.push_back(quad_verts[1]);
-        out_mesh.vertices.push_back(quad_verts[2]);
-        out_mesh.vertices.push_back(quad_verts[3]);
-    }
+        out_mesh.vertices.append_range(std::array {quad_verts[0], quad_verts[1], quad_verts[2], quad_verts[3]});
 
     ++out_mesh.quad_count;
 }
@@ -229,7 +219,7 @@ void ChunkDrawTable::flush_dirty(vulk::VulkanContext& ctx, vulk::BufferHandle gp
 {
     if (m_dirty_slots.empty() || m_entries.empty()) return;
 
-    std::sort(m_dirty_slots.begin(), m_dirty_slots.end());
+    std::ranges::sort(m_dirty_slots);
 
     const u32 uploaded =
         ctx.upload_buffer_elements(gpu_buffer, m_entries.data(), static_cast<u32>(sizeof(GpuChunkDraw)), m_dirty_slots);
