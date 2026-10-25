@@ -11,16 +11,16 @@
 namespace vl
 {
 
-constexpr i32 NEAR_RADIUS = 3;
+inline constexpr i32 NEAR_RADIUS = 3;
 
 // Per-frame budgets
-constexpr f64 SKY_AIR_TIME_BUDGET_MS = 2.0;
-constexpr f64 BFS_MIN_INTERVAL_MS = 250.0;
-constexpr u32 GEN_WORK_BUDGET_PER_FRAME = 4096;
-constexpr u32 MESH_WORK_BUDGET_PER_FRAME = 4096;
-constexpr u32 MAX_GEN_BATCH_CHUNKS = 2048;
-constexpr u32 MAX_MESH_BATCH_CHUNKS = 2048;
-constexpr u64 MAX_UPLOAD_BYTES_PER_FRAME = 16ull * 2048 * 2048;
+inline constexpr f64 SKY_AIR_TIME_BUDGET_MS = 2.0;
+inline constexpr f64 BFS_MIN_INTERVAL_MS = 250.0;
+inline constexpr u32 GEN_WORK_BUDGET_PER_FRAME = 4096;
+inline constexpr u32 MESH_WORK_BUDGET_PER_FRAME = 4096;
+inline constexpr u32 MAX_GEN_BATCH_CHUNKS = 2048;
+inline constexpr u32 MAX_MESH_BATCH_CHUNKS = 2048;
+inline constexpr u64 MAX_UPLOAD_BYTES_PER_FRAME = 16ull * 2048 * 2048;
 
 class WorldManager
 {

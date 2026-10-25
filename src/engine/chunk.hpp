@@ -6,11 +6,11 @@
 namespace vl
 {
 
-constexpr i32 CHUNK_SIZE = 32;
-constexpr i32 CHUNK_AREA = CHUNK_SIZE * CHUNK_SIZE;
-constexpr i32 CHUNK_VOLUME = CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE;
+inline constexpr i32 CHUNK_SIZE = 32;
+inline constexpr i32 CHUNK_AREA = CHUNK_SIZE * CHUNK_SIZE;
+inline constexpr i32 CHUNK_VOLUME = CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE;
 
-constexpr u32 MAX_LOD = 5;
+inline constexpr u32 MAX_LOD = 5;
 
 // Bit layout:
 //   Bits  0..5  (6 bits) -> Local X position [0..32]

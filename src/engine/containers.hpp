@@ -217,7 +217,7 @@ public:
         return total;
     }
 
-    [[nodiscard]] static constexpr u32 total_capacity()
+    [[nodiscard]] static consteval u32 total_capacity()
     {
         return compute_lod_pool_capacity<1>() + compute_lod_pool_capacity<2>() + compute_lod_pool_capacity<3>() +
                compute_lod_pool_capacity<4>() + compute_lod_pool_capacity<5>();
