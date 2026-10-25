@@ -30,13 +30,16 @@ using usize = std::size_t;
 template <typename Tag = void>
 struct Handle
 {
-    u32 index = ~0u;
+    static constexpr u32 INVALID_INDEX = ~0u;
+
+    u32 index = INVALID_INDEX;
     u32 generation = 0;
 
     constexpr Handle() = default;
     constexpr Handle(u32 idx, u32 gen) : index(idx), generation(gen) {}
 
-    static constexpr Handle invalid() { return Handle {~0u, 0}; }
+    [[nodiscard]] static constexpr Handle invalid() { return Handle {INVALID_INDEX, 0}; }
 
-    constexpr bool is_valid() const { return index != ~0u; }
+    [[nodiscard]] constexpr bool is_valid() const { return index != INVALID_INDEX; }
 };
+
