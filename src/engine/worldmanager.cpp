@@ -147,12 +147,12 @@ void WorldManager::set_world_block(i32 wx, i32 wy, i32 wz, BlockID id)
     if (m_bfs_in_flight) m_bfs_needs_rerun = true;
 
     constexpr u32 last_m = CHUNK_SIZE - 1u;
-    if (lx_m == 0u) mark_dirty(chunk_coord + glm::ivec3(-1, 0, 0));
-    if (lx_m == last_m) mark_dirty(chunk_coord + glm::ivec3(1, 0, 0));
-    if (ly_m == 0u) mark_dirty(chunk_coord + glm::ivec3(0, -1, 0));
-    if (ly_m == last_m) mark_dirty(chunk_coord + glm::ivec3(0, 1, 0));
-    if (lz_m == 0u) mark_dirty(chunk_coord + glm::ivec3(0, 0, -1));
-    if (lz_m == last_m) mark_dirty(chunk_coord + glm::ivec3(0, 0, 1));
+    if (lx_m == 0u) mark_dirty(chunk_coord + to_offset(Direction::Left));
+    if (lx_m == last_m) mark_dirty(chunk_coord + to_offset(Direction::Right));
+    if (ly_m == 0u) mark_dirty(chunk_coord + to_offset(Direction::Down));
+    if (ly_m == last_m) mark_dirty(chunk_coord + to_offset(Direction::Up));
+    if (lz_m == 0u) mark_dirty(chunk_coord + to_offset(Direction::Back));
+    if (lz_m == last_m) mark_dirty(chunk_coord + to_offset(Direction::Front));
 }
 
 void WorldManager::update(const glm::vec3& cam_world_pos, vulk::VulkanContext& ctx)
@@ -376,11 +376,11 @@ void WorldManager::execute_background_bfs()
         const u32 mask = (state >> 4u) & GridCell::ALL_PORTALS;
         if (mask == 0u) continue;
 
-        for (u8 d = 0; d < 6; ++d)
+        for (Direction d : ALL_DIRECTIONS)
         {
-            if ((mask & (1u << d)) == 0u) continue;
+            if ((mask & direction_bit(d)) == 0u) continue;
 
-            const glm::ivec3& o = DIR_OFFSETS[d];
+            const glm::ivec3 o = to_offset(d);
             const i32 ndx = dx + o.x;
             const i32 ny = y + o.y;
             const i32 ndz = dz + o.z;
@@ -435,11 +435,11 @@ bool WorldManager::expand_frontier_from(
     GridCell* const grid = m_grid.get();
     bool revealed_unloaded = false;
 
-    for (u8 d = 0; d < 6; ++d)
+    for (Direction d : ALL_DIRECTIONS)
     {
-        if ((mask & (1u << d)) == 0u) continue;
+        if ((mask & direction_bit(d)) == 0u) continue;
 
-        const glm::ivec3 ncoord = coord + DIR_OFFSETS[d];
+        const glm::ivec3 ncoord = coord + to_offset(d);
         if (!is_y_in_world(ncoord.y) || std::abs(ncoord.x - origin.x) > rd || std::abs(ncoord.z - origin.z) > rd) continue;
 
         GridCell& ncell = grid[cell_index(ncoord)];
@@ -700,7 +700,7 @@ void WorldManager::generate_wanted_chunks(const glm::ivec3& origin, i32 rd, vulk
             const GridCell& cell = m_grid[cell_index(item.coord)];
             const u8 newly_closed_portals = static_cast<u8>(item.old_portal_mask & ~item.portal_mask);
 
-            const bool reaches_sky = !item.non_air || (((item.portal_mask & (1u << static_cast<u8>(Direction::Up))) != 0u) &&
+            const bool reaches_sky = !item.non_air || (((item.portal_mask & direction_bit(Direction::Up)) != 0u) &&
                                                        (((item.coord.y + 1) * CHUNK_SIZE) > item.column_max_height));
             if (item.was_unloaded && reaches_sky)
                 fill_air_column_above(item.coord.x, item.coord.z, item.column_max_height, origin, rd);
@@ -722,7 +722,7 @@ void WorldManager::generate_wanted_chunks(const glm::ivec3& origin, i32 rd, vulk
 
 void WorldManager::on_chunk_loaded(const glm::ivec3& coord, bool high_priority)
 {
-    for (const glm::ivec3& o : DIR_OFFSETS)
+    for (const glm::ivec3& o : DIRECTION_OFFSETS)
     {
         const glm::ivec3 n = coord + o;
         const GridCell* cell = find_real_cell(n);

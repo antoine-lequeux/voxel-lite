@@ -21,6 +21,41 @@ enum class Direction : u8
     Front = 5, // +Z
 };
 
+inline constexpr usize DIRECTION_COUNT = 6;
+
+[[nodiscard]] constexpr usize to_index(Direction dir)
+{
+    return std::to_underlying(dir);
+}
+
+[[nodiscard]] constexpr u8 direction_bit(Direction dir)
+{
+    return static_cast<u8>(1u << to_index(dir));
+}
+
+[[nodiscard]] constexpr Direction opposite(Direction dir)
+{
+    return static_cast<Direction>(to_index(dir) ^ 1u);
+}
+
+inline constexpr std::array<Direction, DIRECTION_COUNT> ALL_DIRECTIONS = {
+    Direction::Left, Direction::Right, Direction::Down, Direction::Up, Direction::Back, Direction::Front,
+};
+
+inline constexpr std::array<glm::ivec3, DIRECTION_COUNT> DIRECTION_OFFSETS = {{
+    {-1, 0, 0}, // Left (-X)
+    {1, 0, 0},  // Right (+X)
+    {0, -1, 0}, // Down (-Y)
+    {0, 1, 0},  // Up (+Y)
+    {0, 0, -1}, // Back (-Z)
+    {0, 0, 1},  // Front (+Z)
+}};
+
+[[nodiscard]] constexpr glm::ivec3 to_offset(Direction dir)
+{
+    return DIRECTION_OFFSETS[to_index(dir)];
+}
+
 namespace BlockType
 {
 inline constexpr BlockID Air = 0;
@@ -47,7 +82,7 @@ struct BlockDef
     std::string_view name = "Air";
 
     // Color per face indexed by direction
-    std::array<glm::vec3, 6> face_colors {};
+    std::array<glm::vec3, DIRECTION_COUNT> face_colors {};
 
     f32 roughness = 0.85f;
 
@@ -57,14 +92,14 @@ struct BlockDef
     u8 light_opacity = 0;  // How much light is absorbed passing through (0 = clear, 15 = fully opaque)
     u8 light_emission = 0; // Self-emission level (0 = none, 15 = max brightness)
 
-    [[nodiscard]] constexpr glm::vec3 color_for_face(Direction dir) const { return face_colors[static_cast<usize>(dir)]; }
+    [[nodiscard]] constexpr glm::vec3 color_for_face(Direction dir) const { return face_colors[to_index(dir)]; }
 
-    [[nodiscard]] static constexpr std::array<glm::vec3, 6> uniform_colors(glm::vec3 color)
+    [[nodiscard]] static constexpr std::array<glm::vec3, DIRECTION_COUNT> uniform_colors(glm::vec3 color)
     {
         return {color, color, color, color, color, color};
     }
 
-    [[nodiscard]] static constexpr std::array<glm::vec3, 6>
+    [[nodiscard]] static constexpr std::array<glm::vec3, DIRECTION_COUNT>
     top_bottom_side_colors(glm::vec3 top, glm::vec3 bottom, glm::vec3 side)
     {
         return {side, side, bottom, top, side, side};
@@ -75,7 +110,7 @@ struct BlockDef
 struct GpuBlockMaterial
 {
     // xyz = face RGB color, w = surface roughness
-    std::array<glm::vec4, 6> face_color_and_roughness {};
+    std::array<glm::vec4, DIRECTION_COUNT> face_color_and_roughness {};
 
     // x = normalized light emission [0..1], y = normalized opacity [0..1], z = visibility [0..2]
     // w is reserved
@@ -209,7 +244,7 @@ inline constexpr std::array<BlockDef, BlockType::Count> BLOCK_REGISTRY {{
     {
         const BlockDef& def = BLOCK_REGISTRY[i];
         GpuBlockMaterial& mat = gpu_materials[i];
-        for (usize face = 0; face < 6; ++face)
+        for (usize face = 0; face < DIRECTION_COUNT; ++face)
         {
             const glm::vec3 c = def.face_colors[face];
             mat.face_color_and_roughness[face] = glm::vec4 {c.x, c.y, c.z, def.roughness};
@@ -217,7 +252,7 @@ inline constexpr std::array<BlockDef, BlockType::Count> BLOCK_REGISTRY {{
         mat.emission_and_opacity = glm::vec4 {
             static_cast<f32>(def.light_emission) / 15.0f,
             static_cast<f32>(def.light_opacity) / 15.0f,
-            static_cast<f32>(def.visibility),
+            static_cast<f32>(std::to_underlying(def.visibility)),
             0.0f,
         };
     }

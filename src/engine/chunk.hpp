@@ -24,7 +24,7 @@ using PackedVertex = u32;
 
 [[nodiscard]] constexpr PackedVertex pack_vertex(u32 x, u32 y, u32 z, Direction normal, u32 ao_level, u32 uv_id, BlockID block_id)
 {
-    return (x & 0x3Fu) | ((y & 0x3Fu) << 6u) | ((z & 0x3Fu) << 12u) | ((static_cast<u32>(normal) & 0x07u) << 18u) |
+    return (x & 0x3Fu) | ((y & 0x3Fu) << 6u) | ((z & 0x3Fu) << 12u) | ((static_cast<u32>(to_index(normal)) & 0x07u) << 18u) |
            ((ao_level & 0x03u) << 21u) | ((uv_id & 0x03u) << 23u) | ((static_cast<u32>(block_id) & 0x7Fu) << 25u);
 }
 
@@ -222,7 +222,7 @@ public:
 
             auto update_face = [&](Direction dir) {
                 if (!is_opaque)
-                    m_portal_mask |= static_cast<u8>(1u << static_cast<u8>(dir));
+                    m_portal_mask |= direction_bit(dir);
                 else
                     recalculate_single_face(dir);
             };
@@ -238,7 +238,7 @@ public:
 
     constexpr void recalculate_single_face(Direction dir)
     {
-        m_portal_mask &= static_cast<u8>(~(1u << static_cast<u8>(dir)));
+        m_portal_mask &= static_cast<u8>(~direction_bit(dir));
         constexpr u32 last = DIM - 1u;
 
         auto check_and_set = [&](u32 x, u32 y, u32 z) {
@@ -281,7 +281,7 @@ public:
 
     [[nodiscard]] constexpr bool has_portal(Direction direction) const
     {
-        return (m_portal_mask & (1u << static_cast<u8>(direction))) != 0u;
+        return (m_portal_mask & direction_bit(direction)) != 0u;
     }
 
     constexpr void recalculate_portal_mask()

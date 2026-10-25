@@ -210,15 +210,6 @@ private:
         void ExecuteRange(enki::TaskSetPartition, u32) override { manager->execute_background_bfs(); }
     };
 
-    static constexpr std::array<glm::ivec3, 6> DIR_OFFSETS {{
-        {-1, 0, 0}, // Left
-        {1, 0, 0},  // Right
-        {0, -1, 0}, // Down
-        {0, 1, 0},  // Up
-        {0, 0, -1}, // Back
-        {0, 0, 1},  // Front
-    }};
-
     [[nodiscard]] static constexpr i32 wrap_xz(i32 v)
     {
         const i32 m = v % GRID_XZ;
@@ -299,12 +290,12 @@ private:
     [[nodiscard]] ChunkNeighbors get_mesh_neighbors(const glm::ivec3& coord) const
     {
         return ChunkNeighbors {
-            .left = mesh_neighbor(coord + DIR_OFFSETS[0]),
-            .right = mesh_neighbor(coord + DIR_OFFSETS[1]),
-            .down = mesh_neighbor(coord + DIR_OFFSETS[2]),
-            .up = mesh_neighbor(coord + DIR_OFFSETS[3]),
-            .back = mesh_neighbor(coord + DIR_OFFSETS[4]),
-            .front = mesh_neighbor(coord + DIR_OFFSETS[5]),
+            .left = mesh_neighbor(coord + to_offset(Direction::Left)),
+            .right = mesh_neighbor(coord + to_offset(Direction::Right)),
+            .down = mesh_neighbor(coord + to_offset(Direction::Down)),
+            .up = mesh_neighbor(coord + to_offset(Direction::Up)),
+            .back = mesh_neighbor(coord + to_offset(Direction::Back)),
+            .front = mesh_neighbor(coord + to_offset(Direction::Front)),
         };
     }
 
@@ -312,8 +303,8 @@ private:
     [[nodiscard]] static constexpr u8 extract_portal_mask(const ChunkT& chunk)
     {
         u8 mask = 0;
-        for (u8 d = 0; d < 6; ++d)
-            if (chunk.has_portal(static_cast<Direction>(d))) mask |= static_cast<u8>(1u << d);
+        for (Direction dir : ALL_DIRECTIONS)
+            if (chunk.has_portal(dir)) mask |= direction_bit(dir);
         return mask;
     }
 

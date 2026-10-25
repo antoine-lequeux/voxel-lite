@@ -16,7 +16,7 @@ struct FaceCornerOffset
     u32 uv_id; // bit 0 = U, bit 1 = V
 };
 
-inline constexpr std::array<std::array<FaceCornerOffset, 4>, 6> FACE_CORNERS {{
+inline constexpr std::array<std::array<FaceCornerOffset, 4>, DIRECTION_COUNT> FACE_CORNERS {{
     // Left (-X)
     {{
         {0u, 0u, 0u, 0u},
@@ -122,7 +122,7 @@ void emit_face(
 )
 {
     constexpr u32 scale = Chunk<Lod>::SCALE;
-    const auto& corners = FACE_CORNERS[static_cast<usize>(dir)];
+    const auto& corners = FACE_CORNERS[to_index(dir)];
     const i32 bx = static_cast<i32>(x);
     const i32 by = static_cast<i32>(y);
     const i32 bz = static_cast<i32>(z);
