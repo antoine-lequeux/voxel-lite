@@ -298,6 +298,15 @@ public:
     bool upload_buffer_data(BufferHandle handle, u64 offset_bytes, std::span<const u8> data);
     bool upload_buffer_data(BufferHandle handle, u64 offset_bytes, const void* data, usize size_bytes);
 
+    // Uploads scattered elements (src[i] -> dst[i] for i in 0..element_indices) through the per-frame
+    // staging buffer using a single copy command (consecutive indices are merged into one copy region)
+    // Returns the number of leading indices that were uploaded (fewer than requested when the staging buffer is full)
+    u32
+    upload_buffer_elements(BufferHandle dst, const void* src_elements, u32 element_size, std::span<const u32> element_indices);
+
+    // Reads back host-visible (GpuToCpu) buffer memory, invalidating incoherent memory first
+    bool read_buffer_data(BufferHandle handle, u64 offset_bytes, void* dst, usize size_bytes);
+
     [[nodiscard]] void* map_buffer(BufferHandle handle);
     void unmap_buffer(BufferHandle handle);
 
@@ -337,9 +346,8 @@ public:
     void destroy_shader(ShaderHandle handle);
 
     [[nodiscard]] PipelineHandle create_graphics_pipeline(const GraphicsPipelineDesc& desc);
-    [[nodiscard]] PipelineHandle create_compute_pipeline(
-        ShaderHandle compute_shader, std::string_view entry_point = "computeMain", u32 push_constant_size = 128
-    );
+    [[nodiscard]] PipelineHandle
+    create_compute_pipeline(ShaderHandle compute_shader, std::string_view entry_point = "computeMain");
     void destroy_pipeline(PipelineHandle handle);
 
     // Command recording
@@ -380,6 +388,7 @@ public:
         BufferHandle indirect_buffer, u64 offset_bytes, BufferHandle count_buffer, u64 count_offset_bytes, u32 max_draw_count,
         u32 stride = static_cast<u32>(sizeof(DrawIndexedIndirectCommand))
     );
+    void report_indirect_triangles(u32 triangle_count);
 
     // Compute dispatch and barriers
     void dispatch_compute(u32 group_count_x, u32 group_count_y = 1, u32 group_count_z = 1);
@@ -389,6 +398,10 @@ public:
     void memory_barrier_compute_to_compute();
     void memory_barrier_transfer_to_compute();
     void memory_barrier_transfer_to_graphics();
+
+    // Protects buffers read by previously submitted frames from being overwritten by
+    // transfer commands recorded in the current frame
+    void memory_barrier_graphics_to_transfer();
 
 private:
 

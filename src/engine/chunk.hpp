@@ -28,11 +28,52 @@ using PackedVertex = u32;
            ((ao_level & 0x03u) << 21u) | ((uv_id & 0x03u) << 23u) | ((static_cast<u32>(block_id) & 0x7Fu) << 25u);
 }
 
+inline constexpr u32 INVALID_DRAW_SLOT = std::numeric_limits<u32>::max();
+
+// Per-chunk draw metadata read on the GPU by shaders
+struct alignas(16) GpuChunkDraw
+{
+    glm::ivec4 origin_and_quads {0, 0, 0, 0}; // xyz = chunk world origin in blocks, w = quad_count (0 = empty)
+    u64 vertex_buffer_address = 0;
+    u64 reserved = 0;
+};
+
+static_assert(sizeof(GpuChunkDraw) == 32);
+
+// Persistent CPU-side table of active chunk meshes mirrored incrementally to a GPU buffer for indirect rendering
+class ChunkDrawTable
+{
+public:
+
+    static ChunkDrawTable& instance();
+
+    u32 update_slot(u32 current_slot, const glm::ivec3& coord, u32 quad_count, u64 device_address);
+    void free_slot(u32 slot);
+    void reset();
+
+    [[nodiscard]] u32 active_count() const { return m_active_count; }
+    [[nodiscard]] u32 slot_limit() const { return static_cast<u32>(m_entries.size()); }
+    [[nodiscard]] bool has_dirty_slots() const { return !m_dirty_slots.empty(); }
+
+    void flush_dirty(vulk::VulkanContext& ctx, vulk::BufferHandle gpu_buffer);
+
+private:
+
+    void mark_dirty(u32 slot);
+
+    std::vector<GpuChunkDraw> m_entries {};
+    std::vector<u32> m_free_slots {};
+    std::vector<u32> m_dirty_slots {};
+    std::vector<u8> m_dirty_flags {};
+    u32 m_active_count = 0;
+};
+
 struct ChunkMesh
 {
     glm::ivec3 coord {0, 0, 0};
     std::vector<PackedVertex> vertices {};
     u32 quad_count = 0;
+    u32 draw_slot = INVALID_DRAW_SLOT;
     bool meshed_once = false;
 
     // GPU storage buffer for vertex pulling
@@ -65,11 +106,13 @@ struct ChunkMesh
         device_address = donor.device_address;
         buffer_capacity_bytes = donor.buffer_capacity_bytes;
         quad_count = donor.quad_count;
+        draw_slot = donor.draw_slot;
         meshed_once = donor.meshed_once;
         donor.vertex_buffer = {};
         donor.device_address = 0;
         donor.buffer_capacity_bytes = 0;
         donor.quad_count = 0;
+        donor.draw_slot = INVALID_DRAW_SLOT;
     }
 
     // Uploads the generated PackedVertex array to VRAM and ensures the shared quad index buffer is large enough

@@ -1,5 +1,7 @@
 #include "engine/chunk.hpp"
 
+#include <algorithm>
+
 namespace vl
 {
 
@@ -156,6 +158,99 @@ void emit_face(
 
 } // namespace
 
+ChunkDrawTable& ChunkDrawTable::instance()
+{
+    static ChunkDrawTable table;
+    return table;
+}
+
+u32 ChunkDrawTable::update_slot(u32 current_slot, const glm::ivec3& coord, u32 quad_count, u64 device_address)
+{
+    u32 slot = current_slot;
+    if (slot == INVALID_DRAW_SLOT)
+    {
+        if (!m_free_slots.empty())
+        {
+            slot = m_free_slots.back();
+            m_free_slots.pop_back();
+        }
+        else
+        {
+            slot = static_cast<u32>(m_entries.size());
+            m_entries.emplace_back();
+            m_dirty_flags.push_back(0u);
+        }
+        ++m_active_count;
+    }
+
+    const GpuChunkDraw entry {
+        .origin_and_quads =
+            glm::ivec4 {
+                coord.x * CHUNK_SIZE,
+                coord.y * CHUNK_SIZE,
+                coord.z * CHUNK_SIZE,
+                static_cast<i32>(quad_count),
+            },
+        .vertex_buffer_address = device_address,
+        .reserved = 0u,
+    };
+
+    GpuChunkDraw& dst = m_entries[slot];
+    if (dst.origin_and_quads != entry.origin_and_quads || dst.vertex_buffer_address != entry.vertex_buffer_address)
+    {
+        dst = entry;
+        mark_dirty(slot);
+    }
+
+    return slot;
+}
+
+void ChunkDrawTable::free_slot(u32 slot)
+{
+    if (slot == INVALID_DRAW_SLOT || slot >= m_entries.size()) return;
+    if (m_entries[slot].origin_and_quads.w == 0 && m_entries[slot].vertex_buffer_address == 0) return;
+
+    m_entries[slot] = GpuChunkDraw {};
+    mark_dirty(slot);
+    m_free_slots.push_back(slot);
+    if (m_active_count > 0u) --m_active_count;
+}
+
+void ChunkDrawTable::reset()
+{
+    m_entries.clear();
+    m_free_slots.clear();
+    m_dirty_slots.clear();
+    m_dirty_flags.clear();
+    m_active_count = 0;
+}
+
+void ChunkDrawTable::flush_dirty(vulk::VulkanContext& ctx, vulk::BufferHandle gpu_buffer)
+{
+    if (m_dirty_slots.empty() || m_entries.empty()) return;
+
+    std::sort(m_dirty_slots.begin(), m_dirty_slots.end());
+
+    const u32 uploaded =
+        ctx.upload_buffer_elements(gpu_buffer, m_entries.data(), static_cast<u32>(sizeof(GpuChunkDraw)), m_dirty_slots);
+
+    for (u32 i = 0; i < uploaded; ++i) m_dirty_flags[m_dirty_slots[i]] = 0u;
+
+    if (uploaded >= m_dirty_slots.size())
+        m_dirty_slots.clear();
+    else
+        m_dirty_slots.erase(m_dirty_slots.begin(), m_dirty_slots.begin() + uploaded);
+}
+
+void ChunkDrawTable::mark_dirty(u32 slot)
+{
+    if (m_dirty_flags[slot] == 0u)
+    {
+        m_dirty_flags[slot] = 1u;
+        m_dirty_slots.push_back(slot);
+    }
+}
+
 bool ChunkMesh::upload_to_gpu(vulk::VulkanContext& ctx)
 {
     if (vertices.empty() || quad_count == 0u)
@@ -170,6 +265,7 @@ bool ChunkMesh::upload_to_gpu(vulk::VulkanContext& ctx)
     if (vertex_buffer.is_valid() && buffer_capacity_bytes >= required_bytes)
     {
         ctx.upload_buffer_data(vertex_buffer, 0, vertices.data(), static_cast<usize>(required_bytes));
+        draw_slot = ChunkDrawTable::instance().update_slot(draw_slot, coord, quad_count, device_address);
         const vulk::BufferHandle quad_ibo = ctx.get_or_create_quad_index_buffer(quad_count);
         return quad_ibo.is_valid();
     }
@@ -191,6 +287,12 @@ bool ChunkMesh::upload_to_gpu(vulk::VulkanContext& ctx)
     {
         device_address = ctx.get_buffer_device_address(vertex_buffer);
         buffer_capacity_bytes = required_bytes;
+        draw_slot = ChunkDrawTable::instance().update_slot(draw_slot, coord, quad_count, device_address);
+    }
+    else if (draw_slot != INVALID_DRAW_SLOT)
+    {
+        ChunkDrawTable::instance().free_slot(draw_slot);
+        draw_slot = INVALID_DRAW_SLOT;
     }
 
     const vulk::BufferHandle quad_ibo = ctx.get_or_create_quad_index_buffer(quad_count);
@@ -199,6 +301,12 @@ bool ChunkMesh::upload_to_gpu(vulk::VulkanContext& ctx)
 
 void ChunkMesh::destroy_gpu_resources(vulk::VulkanContext& ctx)
 {
+    if (draw_slot != INVALID_DRAW_SLOT)
+    {
+        ChunkDrawTable::instance().free_slot(draw_slot);
+        draw_slot = INVALID_DRAW_SLOT;
+    }
+
     if (vertex_buffer.is_valid())
     {
         ctx.destroy_buffer(vertex_buffer);

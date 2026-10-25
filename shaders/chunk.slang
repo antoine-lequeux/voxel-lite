@@ -4,12 +4,18 @@ struct GpuBlockMaterial
     float4 emission_and_opacity;
 };
 
+struct GpuChunkDraw
+{
+    int4     origin_and_quads; // xyz = chunk world origin (blocks), w = quad count
+    uint*    vertex_buffer;
+    uint64_t reserved;
+};
+
 struct PushConstants
 {
     column_major float4x4 mvp;
-    float4                chunk_origin_and_time;
-    float4                camera_pos;
-    uint*                 vertex_buffer;
+    float4                camera_pos_and_time;
+    GpuChunkDraw*         chunk_draws;
     GpuBlockMaterial*     material_buffer;
 };
 
@@ -37,21 +43,26 @@ static const float TEXTURE_CUTOFF_DIST = 128.0;
 
 struct VSOutput
 {
-    float4 position                 : SV_Position;
-    float3 world_pos                : TEXCOORD0;
-    float3 normal                   : TEXCOORD1;
-    float3 color                    : TEXCOORD2;
-    float2 uv                       : TEXCOORD3;
-    float  ao                       : TEXCOORD4;
-    float  roughness                : TEXCOORD5;
-    float  emission                 : TEXCOORD6;
-    nointerpolation uint visibility : TEXCOORD7;
+    float4 position                  : SV_Position;
+    float3 world_pos                 : TEXCOORD0;
+    float3 normal                    : TEXCOORD1;
+    float3 color                     : TEXCOORD2;
+    float2 uv                        : TEXCOORD3;
+    float  ao                        : TEXCOORD4;
+    float  roughness                 : TEXCOORD5;
+    float  emission                  : TEXCOORD6;
+    nointerpolation uint visibility  : TEXCOORD7;
+    nointerpolation float chunk_dist : TEXCOORD8;
 };
 
+// The draw slot is passed through the first instance of the indirect command
 [shader("vertex")]
-VSOutput vertexMain(uint vertex_id : SV_VertexID)
+VSOutput vertexMain(uint vertex_id : SV_VertexID, uint draw_slot : SV_VulkanInstanceID)
 {
-    uint packed = pc.vertex_buffer[vertex_id];
+    const GpuChunkDraw draw = pc.chunk_draws[draw_slot];
+    const float3 chunk_origin = float3(draw.origin_and_quads.xyz);
+
+    uint packed = draw.vertex_buffer[vertex_id];
 
     uint vx       =  packed         & 0x3Fu;
     uint vy       = (packed >> 6u)  & 0x3Fu;
@@ -62,7 +73,7 @@ VSOutput vertexMain(uint vertex_id : SV_VertexID)
     uint block_id = (packed >> 25u) & 0x7Fu;
 
     float3 local_pos = float3(float(vx), float(vy), float(vz));
-    float3 world_pos = local_pos + pc.chunk_origin_and_time.xyz;
+    float3 world_pos = local_pos + chunk_origin;
 
     GpuBlockMaterial mat = pc.material_buffer[block_id];
     float4 color_rough   = mat.face_color_and_roughness[norm_id];
@@ -77,20 +88,20 @@ VSOutput vertexMain(uint vertex_id : SV_VertexID)
     out_vert.roughness  = color_rough.w;
     out_vert.emission   = mat.emission_and_opacity.x;
     out_vert.visibility = uint(mat.emission_and_opacity.z + 0.5);
+
+    // Distance from camera to chunk center
+    float3 chunk_center  = chunk_origin + float3(16.0, 16.0, 16.0);
+    out_vert.chunk_dist  = length(chunk_center - pc.camera_pos_and_time.xyz);
     return out_vert;
 }
 
 [shader("fragment")]
 float4 fragmentMain(VSOutput input) : SV_Target0
 {
-    // Distance from camera to chunk center
-    float3 chunk_center = pc.chunk_origin_and_time.xyz + float3(16.0, 16.0, 16.0);
-    float  chunk_dist   = length(chunk_center - pc.camera_pos.xyz);
-
     // Unified face color
     float3 base_color = input.color;
 
-    if (chunk_dist < TEXTURE_CUTOFF_DIST)
+    if (input.chunk_dist < TEXTURE_CUTOFF_DIST)
     {
         // 16x16 checkerboard pattern on each face
         float2 texel_coord = floor(clamp(input.uv, 0.0, 0.9999) * 16.0);
@@ -112,7 +123,7 @@ float4 fragmentMain(VSOutput input) : SV_Target0
 
     float3 N = normalize(input.normal);
     float3 L = normalize(float3(0.42, 0.84, 0.36));
-    float3 V = normalize(pc.camera_pos.xyz - input.world_pos);
+    float3 V = normalize(pc.camera_pos_and_time.xyz - input.world_pos);
     float3 H = normalize(L + V);
 
     // Directional sun and ambient lighting

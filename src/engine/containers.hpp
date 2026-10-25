@@ -10,19 +10,19 @@ namespace vl
 inline constexpr u32 INVALID_POOL_INDEX = std::numeric_limits<u32>::max();
 
 inline constexpr i32 MIN_CHUNK_Y = -8;
-inline constexpr i32 MAX_CHUNK_Y = 23;
+inline constexpr i32 MAX_CHUNK_Y = 31;
 inline constexpr i32 WORLD_HEIGHT_CHUNKS = MAX_CHUNK_Y - MIN_CHUNK_Y + 1;
 
 inline constexpr i32 MIN_RENDER_DIST = 4;
-inline constexpr i32 MAX_RENDER_DIST = 256;
-inline constexpr i32 DEFAULT_RENDER_DIST = 32;
+inline constexpr i32 MAX_RENDER_DIST = 512;
+inline constexpr i32 DEFAULT_RENDER_DIST = 128;
 
 // Half extents (in chunks) of the box around the camera chunk for each LOD
 inline constexpr std::array<i32, MAX_LOD> LOD_BOX_RADII = {
-    12,              // LOD 1
-    24,              // LOD 2
-    48,              // LOD 3
-    96,              // LOD 4
+    16,              // LOD 1
+    32,              // LOD 2
+    64,              // LOD 3
+    128,             // LOD 4
     MAX_RENDER_DIST, // LOD 5
 };
 

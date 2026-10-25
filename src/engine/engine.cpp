@@ -18,13 +18,36 @@ namespace
 struct ChunkPushConstants
 {
     glm::mat4 mvp;
-    glm::vec4 chunk_origin_and_time;
-    glm::vec4 camera_pos;
-    u64 vertex_buffer_address;
+    glm::vec4 camera_pos_and_time;
+    u64 chunk_draws_address;
     u64 material_buffer_address;
 };
 
 static_assert(sizeof(ChunkPushConstants) <= 128, "ChunkPushConstants must fit within 128 bytes");
+
+// Matches CullPushConstants in cull.slang
+struct CullPushConstants
+{
+    std::array<glm::vec4, 6> planes {};
+    u64 chunk_draws_address = 0;
+    u64 commands_address = 0;
+    u64 stats_address = 0;
+    u32 slot_count = 0;
+    u32 flags = 0;
+};
+
+static_assert(sizeof(CullPushConstants) <= 128, "CullPushConstants must fit within 128 bytes");
+
+// Matches CullStats in cull.slang
+struct GpuCullStats
+{
+    u32 draw_count = 0;
+    u32 quad_count = 0;
+};
+
+constexpr u32 CULL_FLAG_FRUSTUM = 1u;
+constexpr u32 CULL_WORKGROUP_SIZE = 64u;
+constexpr u32 INITIAL_DRAW_SLOTS_CAPACITY = 65536u;
 
 } // namespace
 
@@ -121,7 +144,67 @@ bool Engine::init_chunk_resources()
     pipe_desc.push_constant_size = sizeof(ChunkPushConstants);
 
     m_chunk_pipeline = m_vulkan_context.create_graphics_pipeline(pipe_desc);
-    return m_chunk_pipeline.is_valid();
+    if (!m_chunk_pipeline.is_valid()) return false;
+
+    m_cull_shader = m_vulkan_context.create_shader_from_file("shaders/cull.spirv");
+    if (!m_cull_shader.is_valid()) return false;
+
+    m_cull_pipeline = m_vulkan_context.create_compute_pipeline(m_cull_shader, "cullMain");
+    if (!m_cull_pipeline.is_valid()) return false;
+
+    for (u32 i = 0; i < FRAMES_IN_FLIGHT; ++i)
+    {
+        constexpr GpuCullStats zero_stats {};
+        m_cull_stats_buffers[i] = m_vulkan_context.create_buffer(
+            sizeof(GpuCullStats),
+            vulk::BufferUsage::Storage | vulk::BufferUsage::Indirect | vulk::BufferUsage::TransferDst |
+                vulk::BufferUsage::ShaderDeviceAddress,
+            vulk::MemoryUsage::GpuToCpu, &zero_stats
+        );
+        if (!m_cull_stats_buffers[i].is_valid()) return false;
+    }
+
+    if (!m_vulkan_context.get_or_create_quad_index_buffer(16384).is_valid()) return false;
+
+    return ensure_draw_buffers_capacity(INITIAL_DRAW_SLOTS_CAPACITY);
+}
+
+bool Engine::ensure_draw_buffers_capacity(u32 required_slots)
+{
+    if (required_slots <= m_draw_buffers_capacity) return true;
+
+    u32 new_capacity = std::max(INITIAL_DRAW_SLOTS_CAPACITY, m_draw_buffers_capacity);
+    while (new_capacity < required_slots) new_capacity *= 2u;
+
+    const u64 draw_bytes = static_cast<u64>(new_capacity) * sizeof(GpuChunkDraw);
+    const vulk::BufferHandle new_draw_buf = m_vulkan_context.create_buffer(
+        draw_bytes,
+        vulk::BufferUsage::Storage | vulk::BufferUsage::TransferSrc | vulk::BufferUsage::TransferDst |
+            vulk::BufferUsage::ShaderDeviceAddress,
+        vulk::MemoryUsage::GpuOnly
+    );
+    if (!new_draw_buf.is_valid()) return false;
+
+    if (m_chunk_draw_buffer.is_valid())
+    {
+        const u64 old_bytes = static_cast<u64>(m_draw_buffers_capacity) * sizeof(GpuChunkDraw);
+        m_vulkan_context.copy_buffer(m_chunk_draw_buffer, new_draw_buf, old_bytes);
+        m_vulkan_context.memory_barrier_graphics_to_transfer();
+        m_vulkan_context.destroy_buffer(m_chunk_draw_buffer);
+    }
+    m_chunk_draw_buffer = new_draw_buf;
+
+    if (m_indirect_buffer.is_valid()) m_vulkan_context.destroy_buffer(m_indirect_buffer);
+
+    const u64 indirect_bytes = static_cast<u64>(new_capacity) * sizeof(vulk::DrawIndexedIndirectCommand);
+    m_indirect_buffer = m_vulkan_context.create_buffer(
+        indirect_bytes, vulk::BufferUsage::Storage | vulk::BufferUsage::Indirect | vulk::BufferUsage::ShaderDeviceAddress,
+        vulk::MemoryUsage::GpuOnly
+    );
+    if (!m_indirect_buffer.is_valid()) return false;
+
+    m_draw_buffers_capacity = new_capacity;
+    return true;
 }
 
 void Engine::process_events()
@@ -210,55 +293,88 @@ void Engine::handle_inputs(f32 dt)
 
 void Engine::render()
 {
+    ChunkDrawTable& draw_table = ChunkDrawTable::instance();
+    const u32 frame_idx = m_vulkan_context.get_current_frame_index() % FRAMES_IN_FLIGHT;
+    const vulk::BufferHandle stats_buf = m_cull_stats_buffers[frame_idx];
+
+    // Read back GPU culling statistics from the previous completed execution of this frame slot
+    if (m_cull_stats_pending[frame_idx])
+    {
+        GpuCullStats stats {};
+        if (m_vulkan_context.read_buffer_data(stats_buf, 0, &stats, sizeof(stats)))
+        {
+            m_last_chunks_drawn = stats.draw_count;
+            m_last_triangles_drawn = stats.quad_count * 2u;
+        }
+        m_cull_stats_pending[frame_idx] = false;
+    }
+
+    const u32 active_meshes = draw_table.active_count();
+    const u32 slot_limit = draw_table.slot_limit();
+
+    if (slot_limit > 0u) ensure_draw_buffers_capacity(slot_limit);
+    if (draw_table.has_dirty_slots()) draw_table.flush_dirty(m_vulkan_context, m_chunk_draw_buffer);
+
+    m_camera.update_far_plane(m_manager->get_render_distance(), CHUNK_SIZE);
+    const glm::mat4 vp = m_camera.view_projection_matrix(m_vulkan_context.get_aspect_ratio());
+    const Frustum frustum = Frustum::from_view_projection(vp);
+
+    if (active_meshes > 0u && slot_limit > 0u)
+    {
+        m_vulkan_context.fill_buffer(stats_buf, 0u, sizeof(GpuCullStats), 0u);
+        m_vulkan_context.memory_barrier_transfer_to_compute();
+        m_vulkan_context.memory_barrier_transfer_to_graphics();
+
+        CullPushConstants cull_pc {};
+        cull_pc.planes = frustum.planes;
+        cull_pc.chunk_draws_address = m_vulkan_context.get_buffer_device_address(m_chunk_draw_buffer);
+        cull_pc.commands_address = m_vulkan_context.get_buffer_device_address(m_indirect_buffer);
+        cull_pc.stats_address = m_vulkan_context.get_buffer_device_address(stats_buf);
+        cull_pc.slot_count = slot_limit;
+        cull_pc.flags = m_overlay.frustum_culling_enabled ? CULL_FLAG_FRUSTUM : 0u;
+
+        m_vulkan_context.bind_pipeline(m_cull_pipeline);
+        m_vulkan_context.push_constants(cull_pc);
+        m_vulkan_context.dispatch_compute((slot_limit + CULL_WORKGROUP_SIZE - 1u) / CULL_WORKGROUP_SIZE);
+        m_vulkan_context.memory_barrier_compute_to_draw();
+        m_cull_stats_pending[frame_idx] = true;
+    }
+    else
+    {
+        m_last_chunks_drawn = 0;
+        m_last_triangles_drawn = 0;
+    }
+
+    const u32 total_loaded = m_manager->get_active_chunks_count();
+    const u32 chunks_drawn = std::min(m_last_chunks_drawn, active_meshes);
+    const u32 chunks_culled = (total_loaded > chunks_drawn) ? (total_loaded - chunks_drawn) : 0u;
+    m_overlay.set_chunk_culling_stats(chunks_drawn, chunks_culled);
+
     vulk::RenderPassInfo pass_info {};
     pass_info.clear_color = {0.47f, 0.65f, 1.0f, 1.0f}; // Sky color
     pass_info.clear_depth = 1.0f;
 
     m_vulkan_context.begin_rendering(pass_info);
 
-    // Bind graphics pipeline and quad index buffer once per frame
-    m_vulkan_context.bind_pipeline(m_chunk_pipeline);
-
-    const vulk::BufferHandle quad_ibo = m_vulkan_context.get_or_create_quad_index_buffer(16384);
-    if (quad_ibo.is_valid()) m_vulkan_context.bind_index_buffer_u32(quad_ibo);
-
-    m_camera.update_far_plane(m_manager->get_render_distance(), CHUNK_SIZE);
-
-    const glm::mat4 vp = m_camera.view_projection_matrix(m_vulkan_context.get_aspect_ratio());
-    const Frustum frustum = Frustum::from_view_projection(vp);
-    const glm::vec4 cam_pos = glm::vec4 {m_camera.position, 1.0f};
-    const u64 material_addr = m_vulkan_context.get_buffer_device_address(m_block_material_buffer);
-
-    u32 chunks_drawn = 0;
-    u32 chunks_culled = 0;
-
-    // Render active chunks across all LOD pools
-    m_manager->for_each_active_mesh([&](const ChunkMesh& mesh) {
-        if (mesh.empty() || mesh.device_address == 0u) return;
-
-        const glm::vec3 origin = mesh.world_origin();
-        constexpr glm::vec3 chunk_dims {static_cast<f32>(CHUNK_SIZE)};
-
-        // Frustum culling
-        if (m_overlay.frustum_culling_enabled && !frustum.intersects_aabb(origin, origin + chunk_dims))
+    if (active_meshes > 0u && slot_limit > 0u)
+    {
+        const vulk::BufferHandle quad_ibo = m_vulkan_context.get_or_create_quad_index_buffer(16384);
+        if (quad_ibo.is_valid())
         {
-            ++chunks_culled;
-            return;
+            m_vulkan_context.bind_pipeline(m_chunk_pipeline);
+            m_vulkan_context.bind_index_buffer_u32(quad_ibo);
+
+            ChunkPushConstants pc {};
+            pc.mvp = vp;
+            pc.camera_pos_and_time = glm::vec4 {m_camera.position, m_elapsed_time};
+            pc.chunk_draws_address = m_vulkan_context.get_buffer_device_address(m_chunk_draw_buffer);
+            pc.material_buffer_address = m_vulkan_context.get_buffer_device_address(m_block_material_buffer);
+
+            m_vulkan_context.push_constants(pc);
+            m_vulkan_context.draw_indexed_indirect_count(m_indirect_buffer, 0, stats_buf, 0, active_meshes);
+            m_vulkan_context.report_indirect_triangles(m_last_triangles_drawn);
         }
-
-        ChunkPushConstants pc {};
-        pc.mvp = vp;
-        pc.chunk_origin_and_time = glm::vec4 {origin, m_elapsed_time};
-        pc.camera_pos = cam_pos;
-        pc.vertex_buffer_address = mesh.device_address;
-        pc.material_buffer_address = material_addr;
-
-        m_vulkan_context.push_constants(pc);
-        m_vulkan_context.draw_indexed(mesh.index_count());
-        ++chunks_drawn;
-    });
-
-    m_overlay.set_chunk_culling_stats(chunks_drawn, chunks_culled);
+    }
 
     // Render ImGui overlay on top of 3D geometry
     m_vulkan_context.render_imgui();
@@ -299,8 +415,8 @@ void Engine::run()
 
         const u64 t1 = SDL_GetPerformanceCounter();
 
+        m_vulkan_context.memory_barrier_graphics_to_transfer();
         m_manager->update(m_camera.position, m_vulkan_context);
-        m_vulkan_context.memory_barrier_transfer_to_graphics();
 
         render();
         m_vulkan_context.end_frame();
@@ -320,6 +436,12 @@ void Engine::shutdown()
     m_manager->destroy_all_gpu_resources(m_vulkan_context);
 
     if (m_block_material_buffer.is_valid()) m_vulkan_context.destroy_buffer(m_block_material_buffer);
+    if (m_chunk_draw_buffer.is_valid()) m_vulkan_context.destroy_buffer(m_chunk_draw_buffer);
+    if (m_indirect_buffer.is_valid()) m_vulkan_context.destroy_buffer(m_indirect_buffer);
+    for (vulk::BufferHandle& buf : m_cull_stats_buffers)
+        if (buf.is_valid()) m_vulkan_context.destroy_buffer(buf);
+    if (m_cull_pipeline.is_valid()) m_vulkan_context.destroy_pipeline(m_cull_pipeline);
+    if (m_cull_shader.is_valid()) m_vulkan_context.destroy_shader(m_cull_shader);
     if (m_chunk_pipeline.is_valid()) m_vulkan_context.destroy_pipeline(m_chunk_pipeline);
     if (m_chunk_shader.is_valid()) m_vulkan_context.destroy_shader(m_chunk_shader);
 

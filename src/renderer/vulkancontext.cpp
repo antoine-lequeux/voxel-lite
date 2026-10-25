@@ -831,16 +831,22 @@ bool VulkanContext::init(SDL_Window* window, const ContextConfig& config)
     features12.scalarBlockLayout = VK_TRUE;
     features12.drawIndirectCount = VK_TRUE;
 
+    VkPhysicalDeviceVulkan11Features features11 {};
+    features11.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES;
+    features11.shaderDrawParameters = VK_TRUE;
+
     VkPhysicalDeviceFeatures features10 {};
     features10.multiDrawIndirect = VK_TRUE;
     features10.drawIndirectFirstInstance = VK_TRUE;
     features10.fillModeNonSolid = VK_TRUE;
     features10.samplerAnisotropy = VK_TRUE;
+    features10.shaderInt64 = VK_TRUE;
 
     vkb::PhysicalDeviceSelector selector {m_impl->vkb_instance};
     selector.set_minimum_version(1, 3)
         .set_required_features_13(features13)
         .set_required_features_12(features12)
+        .set_required_features_11(features11)
         .set_required_features(features10);
 
     if (m_impl->surface != VK_NULL_HANDLE) selector.set_surface(m_impl->surface);
@@ -1613,6 +1619,81 @@ bool VulkanContext::upload_buffer_data(BufferHandle handle, u64 offset_bytes, st
     return ok;
 }
 
+u32 VulkanContext::upload_buffer_elements(
+    BufferHandle dst, const void* src_elements, u32 element_size, std::span<const u32> element_indices
+)
+{
+    if (m_impl == nullptr || src_elements == nullptr || element_size == 0 || element_indices.empty()) return 0;
+    if (!m_impl->frame_active || m_impl->rendering_active) return 0;
+
+    const GpuBuffer* dst_buf = m_impl->buffers.get(dst);
+    if (dst_buf == nullptr) return 0;
+
+    FrameData& frame = m_impl->frames[m_impl->current_frame_index];
+    if (frame.staging_buffer.mapped_ptr == nullptr) return 0;
+
+    const u64 base_offset = (frame.staging_offset + 15ull) & ~15ull;
+    if (base_offset >= frame.staging_buffer.size) return 0;
+
+    const u64 elem_bytes = element_size;
+    const u64 max_elements = (frame.staging_buffer.size - base_offset) / elem_bytes;
+    const u32 count = static_cast<u32>(std::min<u64>(element_indices.size(), max_elements));
+    if (count == 0) return 0;
+
+    const auto* src = static_cast<const u8*>(src_elements);
+    auto* staging = static_cast<u8*>(frame.staging_buffer.mapped_ptr) + base_offset;
+
+    thread_local std::vector<VkBufferCopy> regions;
+    regions.clear();
+
+    for (u32 i = 0; i < count; ++i)
+    {
+        const u64 idx = element_indices[i];
+        const u64 dst_offset = idx * elem_bytes;
+        if (dst_offset + elem_bytes > dst_buf->size) continue;
+
+        const u64 src_offset = base_offset + (static_cast<u64>(i) * elem_bytes);
+        std::memcpy(staging + (static_cast<u64>(i) * elem_bytes), src + dst_offset, elem_bytes);
+
+        // Merge with the previous region when both the source and destination ranges are contiguous
+        if (!regions.empty())
+        {
+            VkBufferCopy& last = regions.back();
+            if (last.srcOffset + last.size == src_offset && last.dstOffset + last.size == dst_offset)
+            {
+                last.size += elem_bytes;
+                continue;
+            }
+        }
+        regions.push_back(VkBufferCopy {.srcOffset = src_offset, .dstOffset = dst_offset, .size = elem_bytes});
+    }
+
+    const u64 written_bytes = static_cast<u64>(count) * elem_bytes;
+    vmaFlushAllocation(m_impl->allocator, frame.staging_buffer.allocation, base_offset, written_bytes);
+    frame.staging_offset = base_offset + written_bytes;
+
+    if (!regions.empty())
+    {
+        vkCmdCopyBuffer(
+            frame.cmd, frame.staging_buffer.buffer, dst_buf->buffer, static_cast<u32>(regions.size()), regions.data()
+        );
+    }
+
+    return count;
+}
+
+bool VulkanContext::read_buffer_data(BufferHandle handle, u64 offset_bytes, void* dst, usize size_bytes)
+{
+    if (m_impl == nullptr || dst == nullptr || size_bytes == 0) return false;
+
+    const GpuBuffer* buf = m_impl->buffers.get(handle);
+    if (buf == nullptr || buf->mapped_ptr == nullptr || offset_bytes + size_bytes > buf->size) return false;
+
+    vmaInvalidateAllocation(m_impl->allocator, buf->allocation, offset_bytes, size_bytes);
+    std::memcpy(dst, static_cast<const u8*>(buf->mapped_ptr) + offset_bytes, size_bytes);
+    return true;
+}
+
 void* VulkanContext::map_buffer(BufferHandle handle)
 {
     if (m_impl == nullptr) return nullptr;
@@ -1937,6 +2018,35 @@ PipelineHandle VulkanContext::create_graphics_pipeline(const GraphicsPipelineDes
     return m_impl->pipelines.insert(std::move(gpu_pipe));
 }
 
+PipelineHandle VulkanContext::create_compute_pipeline(ShaderHandle compute_shader, std::string_view entry_point)
+{
+    if (m_impl == nullptr) return PipelineHandle::invalid();
+
+    const GpuShader* comp_shader = m_impl->shaders.get(compute_shader);
+    if (comp_shader == nullptr) return PipelineHandle::invalid();
+
+    const std::string comp_entry = !comp_shader->compute_entry.empty() ? comp_shader->compute_entry : std::string(entry_point);
+
+    VkComputePipelineCreateInfo compute_info {};
+    compute_info.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+    compute_info.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    compute_info.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    compute_info.stage.module = comp_shader->module;
+    compute_info.stage.pName = comp_entry.c_str();
+    compute_info.layout = m_impl->global_pipeline_layout;
+
+    GpuPipeline gpu_pipe {};
+    gpu_pipe.layout = m_impl->global_pipeline_layout;
+    gpu_pipe.bind_point = VK_PIPELINE_BIND_POINT_COMPUTE;
+
+    if (vkCreateComputePipelines(m_impl->device, VK_NULL_HANDLE, 1, &compute_info, nullptr, &gpu_pipe.pipeline) != VK_SUCCESS)
+    {
+        std::println(stderr, "[VulkanContext] Failed to create compute pipeline");
+        return PipelineHandle::invalid();
+    }
+
+    return m_impl->pipelines.insert(std::move(gpu_pipe));
+}
 
 void VulkanContext::destroy_pipeline(PipelineHandle handle)
 {
@@ -2091,6 +2201,85 @@ void VulkanContext::dispatch_compute_indirect(BufferHandle indirect_buffer, u64 
     if (ind_buf == nullptr) return;
 
     vkCmdDispatchIndirect(m_impl->frames[m_impl->current_frame_index].cmd, ind_buf->buffer, offset_bytes);
+}
+
+void VulkanContext::memory_barrier_compute_to_draw()
+{
+    if (m_impl == nullptr || !m_impl->frame_active) return;
+
+    VkMemoryBarrier2 barrier {};
+    barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+    barrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    barrier.srcAccessMask = VK_ACCESS_2_SHADER_WRITE_BIT;
+    barrier.dstStageMask =
+        VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_2_INDEX_INPUT_BIT;
+    barrier.dstAccessMask = VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_INDEX_READ_BIT;
+
+    VkDependencyInfo dep {};
+    dep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    dep.memoryBarrierCount = 1;
+    dep.pMemoryBarriers = &barrier;
+    vkCmdPipelineBarrier2(m_impl->frames[m_impl->current_frame_index].cmd, &dep);
+}
+
+void VulkanContext::memory_barrier_compute_to_compute()
+{
+    if (m_impl == nullptr || !m_impl->frame_active) return;
+
+    VkMemoryBarrier2 barrier {};
+    barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+    barrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    barrier.srcAccessMask = VK_ACCESS_2_SHADER_WRITE_BIT;
+    barrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    barrier.dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT;
+
+    VkDependencyInfo dep {};
+    dep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    dep.memoryBarrierCount = 1;
+    dep.pMemoryBarriers = &barrier;
+    vkCmdPipelineBarrier2(m_impl->frames[m_impl->current_frame_index].cmd, &dep);
+}
+
+void VulkanContext::memory_barrier_transfer_to_compute()
+{
+    if (m_impl == nullptr || !m_impl->frame_active) return;
+
+    VkMemoryBarrier2 barrier {};
+    barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+    barrier.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+    barrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    barrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    barrier.dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT;
+
+    VkDependencyInfo dep {};
+    dep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    dep.memoryBarrierCount = 1;
+    dep.pMemoryBarriers = &barrier;
+    vkCmdPipelineBarrier2(m_impl->frames[m_impl->current_frame_index].cmd, &dep);
+}
+
+void VulkanContext::report_indirect_triangles(u32 triangle_count)
+{
+    if (m_impl != nullptr) m_impl->triangles_current_frame += triangle_count;
+}
+
+void VulkanContext::memory_barrier_graphics_to_transfer()
+{
+    if (m_impl == nullptr || !m_impl->frame_active) return;
+
+    VkMemoryBarrier2 barrier {};
+    barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+    barrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT |
+                           VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+    barrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    barrier.dstStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+    barrier.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT | VK_ACCESS_2_TRANSFER_READ_BIT;
+
+    VkDependencyInfo dep {};
+    dep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    dep.memoryBarrierCount = 1;
+    dep.pMemoryBarriers = &barrier;
+    vkCmdPipelineBarrier2(m_impl->frames[m_impl->current_frame_index].cmd, &dep);
 }
 
 void VulkanContext::memory_barrier_transfer_to_graphics()

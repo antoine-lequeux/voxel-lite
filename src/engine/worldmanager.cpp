@@ -68,6 +68,7 @@ void WorldManager::destroy_all_gpu_resources(vulk::VulkanContext& ctx)
         m_bfs_in_flight = false;
     }
     m_pools.destroy_all_gpu_resources(ctx);
+    ChunkDrawTable::instance().reset();
 }
 
 bool WorldManager::unload_chunk(const glm::ivec3& coord, vulk::VulkanContext& ctx)
@@ -846,7 +847,7 @@ void WorldManager::process_mesh_queues(vulk::VulkanContext& ctx)
 
             if (uploaded_bytes > 0u && uploaded_bytes + mesh_bytes > MAX_UPLOAD_BYTES_PER_FRAME)
             {
-                mesh.clear();
+                mesh.vertices.clear();
                 chunk.mesh_dirty = true;
                 m_remesh_queues[item.lod - 1u].push_front(item.coord);
                 return;
