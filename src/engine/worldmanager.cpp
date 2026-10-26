@@ -295,9 +295,10 @@ void WorldManager::execute_background_bfs()
     const glm::ivec3 origin = m_bfs_origin;
     const i32 rd = m_bfs_rd;
     const u16* const snap = m_bfs_snapshot.get();
-    u64* const visited = m_bfs_visited_bits.get();
 
-    std::memset(visited, 0, BITSET_WORDS * sizeof(u64));
+    BitSpan visited {std::span<u64> {m_bfs_visited_bits.get(), BITSET_WORDS}};
+    visited.clear();
+
     m_bfs_queue.clear();
     m_bfs_out_candidates.clear();
     m_bfs_out_unwanted.clear();
@@ -316,14 +317,6 @@ void WorldManager::execute_background_bfs()
         return static_cast<u32>((((y - MIN_CHUNK_Y) * GRID_XZ + wz) * GRID_XZ) + wx);
     };
 
-    auto mark_visited = [&](u32 idx) -> bool {
-        const u32 word = idx >> 6u;
-        const u64 bit = 1ull << (idx & 63u);
-        if ((visited[word] & bit) != 0ull) return false;
-        visited[word] |= bit;
-        return true;
-    };
-
     // Every chunk in the near region is wanted regardless of portals
     for (const glm::ivec3& off : m_near_offsets)
     {
@@ -331,7 +324,7 @@ void WorldManager::execute_background_bfs()
         if (!is_y_in_world(y) || std::abs(off.x) > rd || std::abs(off.z) > rd) continue;
 
         const u32 idx = snap_idx(off.x, y, off.z);
-        if (mark_visited(idx)) m_bfs_queue.push_back(SearchNode {.dx = off.x, .dz = off.z, .y = y});
+        if (visited.test_and_set(idx)) m_bfs_queue.push_back(SearchNode {.dx = off.x, .dz = off.z, .y = y});
     }
 
     for (usize head = 0; head < m_bfs_queue.size(); ++head)
@@ -377,7 +370,7 @@ void WorldManager::execute_background_bfs()
             if (!is_y_in_world(ny) || std::abs(ndx) > rd || std::abs(ndz) > rd) continue;
 
             const u32 nidx = snap_idx(ndx, ny, ndz);
-            if (mark_visited(nidx)) m_bfs_queue.push_back(SearchNode {.dx = ndx, .dz = ndz, .y = ny});
+            if (visited.test_and_set(nidx)) m_bfs_queue.push_back(SearchNode {.dx = ndx, .dz = ndz, .y = ny});
         }
     }
 
@@ -394,9 +387,7 @@ void WorldManager::execute_background_bfs()
                 const u16 state = snap[idx];
                 if ((state & 0xFu) == GridCell::TAG_UNLOADED) continue;
 
-                const u32 word = idx >> 6u;
-                const u64 bit = 1ull << (idx & 63u);
-                if ((visited[word] & bit) == 0ull) m_bfs_out_unwanted.emplace_back(origin.x + dx, y, origin.z + dz);
+                if (!visited.test(idx)) m_bfs_out_unwanted.emplace_back(origin.x + dx, y, origin.z + dz);
             }
         }
     }

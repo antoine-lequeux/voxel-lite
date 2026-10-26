@@ -31,6 +31,38 @@ inline constexpr u64 MAX_UPLOAD_BYTES_PER_FRAME = 16ull * 2048 * 2048;
 {
     return length_squared(a - b);
 }
+
+// Bitset view over a 64-bit word buffer
+struct BitSpan
+{
+    std::span<u64> words {};
+
+    void clear() { std::ranges::fill(words, 0ull); }
+
+    [[nodiscard]] bool test(usize index) const
+    {
+        const usize word = index >> 6u;
+        const u64 bit = 1ull << (index & 63u);
+        return (words[word] & bit) != 0ull;
+    }
+
+    void set(usize index)
+    {
+        const usize word = index >> 6u;
+        const u64 bit = 1ull << (index & 63u);
+        words[word] |= bit;
+    }
+
+    [[nodiscard]] bool test_and_set(usize index)
+    {
+        const usize word = index >> 6u;
+        const u64 bit = 1ull << (index & 63u);
+        const bool was_set = (words[word] & bit) != 0ull;
+        words[word] |= bit;
+        return !was_set;
+    }
+};
+
 class WorldManager
 {
 public:
