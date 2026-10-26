@@ -43,3 +43,12 @@ struct Handle
     [[nodiscard]] constexpr bool is_valid() const { return index != INVALID_INDEX; }
 };
 
+// Overload for std::visit pattern matching
+template <typename... Ts>
+struct Overload : Ts...
+{
+    using Ts::operator()...;
+};
+
+template <typename... Ts>
+Overload(Ts...) -> Overload<Ts...>;

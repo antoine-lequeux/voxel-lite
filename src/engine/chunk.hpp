@@ -3,6 +3,8 @@
 #include "block.hpp"
 #include "renderer/vulkancontext.hpp"
 
+#include <variant>
+
 namespace vl
 {
 
@@ -114,6 +116,7 @@ struct ChunkMesh
         quad_count = donor.quad_count;
         draw_slot = donor.draw_slot;
         meshed_once = donor.meshed_once;
+
         donor.vertex_buffer = {};
         donor.device_address = 0;
         donor.buffer_capacity_bytes = 0;
@@ -130,28 +133,33 @@ template <u32 Lod = 1>
     requires(Lod >= 1 && Lod <= MAX_LOD)
 class Chunk;
 
-// View of an adjacent chunk for cross-chunk face culling
+// Representation of adjacent chunk states for cross-chunk face culling
+struct AirNeighbor
+{
+};
+struct SolidNeighbor
+{
+};
+
+using NeighborTarget =
+    std::variant<AirNeighbor, SolidNeighbor, const Chunk<1>*, const Chunk<2>*, const Chunk<3>*, const Chunk<4>*, const Chunk<5>*>;
+
 struct NeighborChunk
 {
-    enum class Kind : u8
-    {
-        Air = 0,   // Air chunk
-        Solid = 1, // Ungenerated chunk (treated as opaque)
-        Real = 2,  // Loaded chunk
-    };
-
-    const void* chunk_ptr = nullptr;
-    Kind kind = Kind::Air;
+    NeighborTarget target {AirNeighbor {}};
     u8 lod = 1;
 
-    [[nodiscard]] static constexpr NeighborChunk air() { return {}; }
-    [[nodiscard]] static constexpr NeighborChunk solid() { return {.chunk_ptr = nullptr, .kind = Kind::Solid, .lod = 1}; }
+    [[nodiscard]] static constexpr NeighborChunk air() { return NeighborChunk {AirNeighbor {}, 1}; }
+    [[nodiscard]] static constexpr NeighborChunk solid() { return NeighborChunk {SolidNeighbor {}, 1}; }
 
     template <u32 Lod>
     [[nodiscard]] static constexpr NeighborChunk from_chunk(const Chunk<Lod>& chunk)
     {
-        return {.chunk_ptr = &chunk, .kind = Kind::Real, .lod = static_cast<u8>(Lod)};
+        return NeighborChunk {&chunk, static_cast<u8>(Lod)};
     }
+
+    [[nodiscard]] constexpr bool is_air() const { return std::holds_alternative<AirNeighbor>(target); }
+    [[nodiscard]] constexpr bool is_solid() const { return std::holds_alternative<SolidNeighbor>(target); }
 
     [[nodiscard]] BlockID sample_meter(u32 x_m, u32 y_m, u32 z_m) const;
 
@@ -261,42 +269,42 @@ public:
         m_portal_mask &= static_cast<u8>(~direction_bit(dir));
         constexpr u32 last = DIM - 1u;
 
-        auto check_and_set = [&](u32 x, u32 y, u32 z) {
-            if (!is_block_opaque(get_block_unchecked(x, y, z)))
+        auto has_transparent_block = [&]<typename CoordFn>(CoordFn get_coords) {
+            for (u32 a = 0; a < DIM; ++a)
             {
-                m_portal_mask |= static_cast<u8>(1u << static_cast<u8>(dir));
-                return true;
+                for (u32 b = 0; b < DIM; ++b)
+                {
+                    const auto [x, y, z] = get_coords(a, b);
+                    if (!is_block_opaque(get_block_unchecked(x, y, z))) return true;
+                }
             }
             return false;
         };
 
-        for (u32 a = 0; a < DIM; ++a)
+        bool has_transparent = false;
+        switch (dir)
         {
-            for (u32 b = 0; b < DIM; ++b)
-            {
-                switch (dir)
-                {
-                    case Direction::Left:
-                        if (check_and_set(0u, a, b)) return;
-                        break;
-                    case Direction::Right:
-                        if (check_and_set(last, a, b)) return;
-                        break;
-                    case Direction::Down:
-                        if (check_and_set(a, 0u, b)) return;
-                        break;
-                    case Direction::Up:
-                        if (check_and_set(a, last, b)) return;
-                        break;
-                    case Direction::Back:
-                        if (check_and_set(a, b, 0u)) return;
-                        break;
-                    case Direction::Front:
-                        if (check_and_set(a, b, last)) return;
-                        break;
-                }
-            }
+            case Direction::Left:
+                has_transparent = has_transparent_block([](u32 y, u32 z) { return std::tuple {0u, y, z}; });
+                break;
+            case Direction::Right:
+                has_transparent = has_transparent_block([=](u32 y, u32 z) { return std::tuple {last, y, z}; });
+                break;
+            case Direction::Down:
+                has_transparent = has_transparent_block([](u32 x, u32 z) { return std::tuple {x, 0u, z}; });
+                break;
+            case Direction::Up:
+                has_transparent = has_transparent_block([=](u32 x, u32 z) { return std::tuple {x, last, z}; });
+                break;
+            case Direction::Back:
+                has_transparent = has_transparent_block([](u32 x, u32 y) { return std::tuple {x, y, 0u}; });
+                break;
+            case Direction::Front:
+                has_transparent = has_transparent_block([=](u32 x, u32 y) { return std::tuple {x, y, last}; });
+                break;
         }
+
+        if (has_transparent) m_portal_mask |= direction_bit(dir);
     }
 
     [[nodiscard]] constexpr bool has_portal(Direction direction) const
@@ -307,29 +315,7 @@ public:
     constexpr void recalculate_portal_mask()
     {
         m_portal_mask = 0;
-        constexpr u32 last = DIM - 1u;
-
-        auto scan_face = [this](Direction dir, auto get_coords) {
-            for (u32 a = 0; a < DIM; ++a)
-            {
-                for (u32 b = 0; b < DIM; ++b)
-                {
-                    const auto [x, y, z] = get_coords(a, b);
-                    if (!is_block_opaque(get_block_unchecked(x, y, z)))
-                    {
-                        m_portal_mask |= static_cast<u8>(1u << static_cast<u8>(dir));
-                        return;
-                    }
-                }
-            }
-        };
-
-        scan_face(Direction::Left, [](u32 y, u32 z) { return std::tuple {0u, y, z}; });
-        scan_face(Direction::Right, [=](u32 y, u32 z) { return std::tuple {last, y, z}; });
-        scan_face(Direction::Down, [](u32 x, u32 z) { return std::tuple {x, 0u, z}; });
-        scan_face(Direction::Up, [=](u32 x, u32 z) { return std::tuple {x, last, z}; });
-        scan_face(Direction::Back, [](u32 x, u32 y) { return std::tuple {x, y, 0u}; });
-        scan_face(Direction::Front, [=](u32 x, u32 y) { return std::tuple {x, y, last}; });
+        for (Direction dir : ALL_DIRECTIONS) recalculate_single_face(dir);
     }
 
     constexpr void fill(BlockID id) { m_blocks.fill(id); }

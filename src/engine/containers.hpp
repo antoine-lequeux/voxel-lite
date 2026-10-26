@@ -77,6 +77,7 @@ public:
     }
 
     [[nodiscard]] constexpr u32 size() const { return m_active_count; }
+    [[nodiscard]] constexpr bool empty() const { return m_active_count == 0u; }
     [[nodiscard]] constexpr bool full() const { return m_free_count == 0u; }
     [[nodiscard]] static constexpr u32 capacity() { return MaxChunks; }
 
@@ -135,11 +136,19 @@ public:
         m_free_slots[m_free_count++] = slot;
     }
 
-    [[nodiscard]] ChunkType& chunk_at(u32 slot) { return *m_chunks[slot]; }
-    [[nodiscard]] const ChunkType& chunk_at(u32 slot) const { return *m_chunks[slot]; }
+    template <typename Self>
+    [[nodiscard]] decltype(auto) chunk_at(this Self&& self, u32 slot)
+    {
+        assert(slot < MaxChunks && self.m_chunks[slot] != nullptr);
+        return *self.m_chunks[slot];
+    }
 
-    [[nodiscard]] ChunkMesh& mesh_at(u32 slot) { return m_meshes[slot]; }
-    [[nodiscard]] const ChunkMesh& mesh_at(u32 slot) const { return m_meshes[slot]; }
+    template <typename Self>
+    [[nodiscard]] decltype(auto) mesh_at(this Self&& self, u32 slot)
+    {
+        assert(slot < self.m_meshes.size());
+        return (self.m_meshes[slot]);
+    }
 
 private:
 
@@ -158,56 +167,30 @@ class LodPoolGroup
 {
 public:
 
-    template <u32 Lod>
+    template <u32 Lod, typename Self>
         requires(Lod >= 1 && Lod <= MAX_LOD)
-    [[nodiscard]] auto& pool()
+    [[nodiscard]] decltype(auto) pool(this Self&& self)
     {
-        return std::get<Lod - 1u>(m_pools);
+        return std::get<Lod - 1u>(self.m_pools);
     }
 
-    template <u32 Lod>
-        requires(Lod >= 1 && Lod <= MAX_LOD)
-    [[nodiscard]] const auto& pool() const
-    {
-        return std::get<Lod - 1u>(m_pools);
-    }
-
-    template <typename Fn>
-    decltype(auto) visit_lod(u8 lod, Fn&& fn)
+    template <typename Self, typename Fn>
+    decltype(auto) visit_lod(this Self&& self, u8 lod, Fn&& fn)
     {
         switch (lod)
         {
-            case 1: return fn(pool<1>());
-            case 2: return fn(pool<2>());
-            case 3: return fn(pool<3>());
-            case 4: return fn(pool<4>());
-            default: return fn(pool<5>());
+            case 1: return std::forward<Fn>(fn)(self.template pool<1>());
+            case 2: return std::forward<Fn>(fn)(self.template pool<2>());
+            case 3: return std::forward<Fn>(fn)(self.template pool<3>());
+            case 4: return std::forward<Fn>(fn)(self.template pool<4>());
+            default: return std::forward<Fn>(fn)(self.template pool<5>());
         }
     }
 
-    template <typename Fn>
-    decltype(auto) visit_lod(u8 lod, Fn&& fn) const
+    template <typename Self, typename Fn>
+    void for_each_pool(this Self&& self, Fn&& fn)
     {
-        switch (lod)
-        {
-            case 1: return fn(pool<1>());
-            case 2: return fn(pool<2>());
-            case 3: return fn(pool<3>());
-            case 4: return fn(pool<4>());
-            default: return fn(pool<5>());
-        }
-    }
-
-    template <typename Fn>
-    void for_each_pool(Fn&& fn)
-    {
-        std::apply([&](auto&... pools) { (fn(pools), ...); }, m_pools);
-    }
-
-    template <typename Fn>
-    void for_each_pool(Fn&& fn) const
-    {
-        std::apply([&](const auto&... pools) { (fn(pools), ...); }, m_pools);
+        std::apply([&](auto&&... pools) { (fn(pools), ...); }, self.m_pools);
     }
 
     [[nodiscard]] u32 total_active_chunks() const
@@ -223,10 +206,10 @@ public:
                compute_lod_pool_capacity<4>() + compute_lod_pool_capacity<5>();
     }
 
-    template <typename Fn>
-    void for_each_active_mesh(Fn&& fn) const
+    template <typename Self, typename Fn>
+    void for_each_active_mesh(this Self&& self, Fn&& fn)
     {
-        for_each_pool([&](const auto& p) {
+        self.for_each_pool([&](auto&& p) {
             const u32 count = p.size();
             for (u32 i = 0; i < count; ++i) fn(p.mesh_at(p.active_slot(i)));
         });

@@ -308,26 +308,22 @@ void ChunkMesh::destroy_gpu_resources(vulk::VulkanContext& ctx)
 
 BlockID NeighborChunk::sample_meter(u32 x_m, u32 y_m, u32 z_m) const
 {
-    if (kind == Kind::Air) return BlockType::Air;
-    if (kind == Kind::Solid) return BlockType::Stone;
-
-    switch (lod)
-    {
-        case 1: return static_cast<const Chunk<1>*>(chunk_ptr)->get_block_at_meter(x_m, y_m, z_m);
-        case 2: return static_cast<const Chunk<2>*>(chunk_ptr)->get_block_at_meter(x_m, y_m, z_m);
-        case 3: return static_cast<const Chunk<3>*>(chunk_ptr)->get_block_at_meter(x_m, y_m, z_m);
-        case 4: return static_cast<const Chunk<4>*>(chunk_ptr)->get_block_at_meter(x_m, y_m, z_m);
-        case 5: return static_cast<const Chunk<5>*>(chunk_ptr)->get_block_at_meter(x_m, y_m, z_m);
-        default: return BlockType::Air;
-    }
+    return std::visit(
+        Overload {
+            [](AirNeighbor) -> BlockID { return BlockType::Air; },
+            [](SolidNeighbor) -> BlockID { return BlockType::Stone; },
+            [=](const auto* chunk) -> BlockID { return chunk->get_block_at_meter(x_m, y_m, z_m); },
+        },
+        target
+    );
 }
 
 bool NeighborChunk::should_render_boundary_face(
     BlockID current, u8 self_lod, u32 x_m, u32 y_m, u32 z_m, u32 sx, u32 sy, u32 sz
 ) const
 {
-    if (kind == Kind::Air) return should_render_face(current, BlockType::Air);
-    if (kind == Kind::Solid) return false;
+    if (is_air()) return should_render_face(current, BlockType::Air);
+    if (is_solid()) return false;
 
     // Neighbor macroblocks are the same size or larger than ours, so a single sample covers the entire face
     if (lod >= self_lod) return should_render_face(current, sample_meter(x_m, y_m, z_m));

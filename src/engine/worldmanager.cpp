@@ -8,12 +8,12 @@ namespace vl
 namespace
 {
 
+template <typename Fn>
 struct ParallelTaskSet : enki::ITaskSet
 {
-    std::function<void(enki::TaskSetPartition, u32)> fn;
+    Fn fn;
 
-    ParallelTaskSet(u32 count, std::function<void(enki::TaskSetPartition, u32)> task_fn)
-        : enki::ITaskSet(count), fn(std::move(task_fn))
+    ParallelTaskSet(u32 count, Fn task_fn) : enki::ITaskSet(count), fn(std::move(task_fn))
     {
         m_Priority = enki::TASK_PRIORITY_HIGH;
     }

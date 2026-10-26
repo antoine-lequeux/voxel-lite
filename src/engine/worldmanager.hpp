@@ -132,22 +132,13 @@ public:
         }
     }
 
-    template <u32 Lod = 1>
+    template <u32 Lod = 1, typename Self>
         requires(Lod >= 1 && Lod <= MAX_LOD)
-    [[nodiscard]] Chunk<Lod>* get_chunk(const glm::ivec3& coord)
+    [[nodiscard]] auto* get_chunk(this Self&& self, const glm::ivec3& coord)
     {
-        const GridCell* cell = find_real_cell(coord);
+        const GridCell* cell = self.find_real_cell(coord);
         if (cell == nullptr || cell->lod() != Lod) return nullptr;
-        return &m_pools.pool<Lod>().chunk_at(cell->index);
-    }
-
-    template <u32 Lod = 1>
-        requires(Lod >= 1 && Lod <= MAX_LOD)
-    [[nodiscard]] const Chunk<Lod>* get_chunk(const glm::ivec3& coord) const
-    {
-        const GridCell* cell = find_real_cell(coord);
-        if (cell == nullptr || cell->lod() != Lod) return nullptr;
-        return &m_pools.pool<Lod>().chunk_at(cell->index);
+        return &self.m_pools.template pool<Lod>().chunk_at(cell->index);
     }
 
     [[nodiscard]] ChunkMesh* get_mesh(const glm::ivec3& coord)
