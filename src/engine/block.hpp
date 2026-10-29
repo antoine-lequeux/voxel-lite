@@ -5,6 +5,7 @@
 #include <array>
 #include <glm/glm.hpp>
 #include <string_view>
+#include <utility>
 
 namespace vl
 {
@@ -54,6 +55,63 @@ inline constexpr std::array<glm::ivec3, DIRECTION_COUNT> DIRECTION_OFFSETS = {{
 [[nodiscard]] constexpr glm::ivec3 to_offset(Direction dir)
 {
     return DIRECTION_OFFSETS[to_index(dir)];
+}
+
+// Chunk portal connectivity encoding:
+//   Bits 0..5  (6 bits)  -> 1 if the face has at least one non-opaque block
+//   Bits 6..20 (15 bits) -> 1 if face pair {a, b} (a != b) is connected by non-opaque blocks inside the chunk
+inline constexpr u32 ALL_OPEN_FACES_MASK = 0b00111111u;
+inline constexpr u32 ALL_PORTAL_CONNECTIVITY = (1u << 21u) - 1u;
+
+[[nodiscard]] consteval std::array<std::array<u32, DIRECTION_COUNT>, DIRECTION_COUNT> build_portal_pair_bits()
+{
+    std::array<std::array<u32, DIRECTION_COUNT>, DIRECTION_COUNT> table {};
+    u32 next_pair_bit = 6u;
+    for (usize a = 0; a < DIRECTION_COUNT; ++a)
+    {
+        table[a][a] = 1u << a;
+        for (usize b = a + 1u; b < DIRECTION_COUNT; ++b)
+        {
+            const u32 bit = 1u << next_pair_bit++;
+            table[a][b] = bit;
+            table[b][a] = bit;
+        }
+    }
+    return table;
+}
+
+inline constexpr auto PORTAL_PAIR_BITS = build_portal_pair_bits();
+
+[[nodiscard]] constexpr u32 portal_pair_bit(Direction a, Direction b)
+{
+    return PORTAL_PAIR_BITS[to_index(a)][to_index(b)];
+}
+
+[[nodiscard]] constexpr u8 open_faces_mask(u32 portal_connectivity)
+{
+    return static_cast<u8>(portal_connectivity & ALL_OPEN_FACES_MASK);
+}
+
+// Returns the 6-bit mask of outgoing faces reachable when entering a chunk through this direction
+[[nodiscard]] constexpr u8 reachable_faces_from(u32 portal_connectivity, Direction in_dir)
+{
+    u8 mask = 0u;
+    for (Direction out_dir : ALL_DIRECTIONS)
+        if ((portal_connectivity & portal_pair_bit(in_dir, out_dir)) != 0u) mask |= direction_bit(out_dir);
+    return mask;
+}
+
+// Converts a 6-bit mask of faces touched by a single connected component into its 21-bit connectivity mask
+[[nodiscard]] constexpr u32 component_faces_to_connectivity(u8 component_faces)
+{
+    u32 conn = component_faces;
+    for (Direction a : ALL_DIRECTIONS)
+    {
+        if ((component_faces & direction_bit(a)) == 0u) continue;
+        for (Direction b : ALL_DIRECTIONS)
+            if ((component_faces & direction_bit(b)) != 0u) conn |= portal_pair_bit(a, b);
+    }
+    return conn;
 }
 
 namespace BlockType

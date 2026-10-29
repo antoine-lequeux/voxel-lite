@@ -3,6 +3,7 @@
 #include "block.hpp"
 #include "renderer/vulkancontext.hpp"
 
+#include <bit>
 #include <variant>
 
 namespace vl
@@ -244,29 +245,11 @@ public:
         const bool was_opaque = is_block_opaque(old_id);
         const bool is_opaque = is_block_opaque(id);
 
-        if (was_opaque != is_opaque)
-        {
-            constexpr u32 last = DIM - 1u;
-
-            auto update_face = [&](Direction dir) {
-                if (!is_opaque)
-                    m_portal_mask |= direction_bit(dir);
-                else
-                    recalculate_single_face(dir);
-            };
-
-            if (x == 0u) update_face(Direction::Left);
-            if (x == last) update_face(Direction::Right);
-            if (y == 0u) update_face(Direction::Down);
-            if (y == last) update_face(Direction::Up);
-            if (z == 0u) update_face(Direction::Back);
-            if (z == last) update_face(Direction::Front);
-        }
+        if (was_opaque != is_opaque) recalculate_portal_mask(true);
     }
 
-    constexpr void recalculate_single_face(Direction dir)
+    [[nodiscard]] constexpr bool face_has_portal(Direction dir) const
     {
-        m_portal_mask &= static_cast<u8>(~direction_bit(dir));
         constexpr u32 last = DIM - 1u;
 
         auto has_transparent_block = [&]<typename CoordFn>(CoordFn get_coords) {
@@ -281,30 +264,16 @@ public:
             return false;
         };
 
-        bool has_transparent = false;
         switch (dir)
         {
-            case Direction::Left:
-                has_transparent = has_transparent_block([](u32 y, u32 z) { return std::tuple {0u, y, z}; });
-                break;
-            case Direction::Right:
-                has_transparent = has_transparent_block([=](u32 y, u32 z) { return std::tuple {last, y, z}; });
-                break;
-            case Direction::Down:
-                has_transparent = has_transparent_block([](u32 x, u32 z) { return std::tuple {x, 0u, z}; });
-                break;
-            case Direction::Up:
-                has_transparent = has_transparent_block([=](u32 x, u32 z) { return std::tuple {x, last, z}; });
-                break;
-            case Direction::Back:
-                has_transparent = has_transparent_block([](u32 x, u32 y) { return std::tuple {x, y, 0u}; });
-                break;
-            case Direction::Front:
-                has_transparent = has_transparent_block([=](u32 x, u32 y) { return std::tuple {x, y, last}; });
-                break;
+            case Direction::Left: return has_transparent_block([](u32 y, u32 z) { return std::tuple {0u, y, z}; });
+            case Direction::Right: return has_transparent_block([=](u32 y, u32 z) { return std::tuple {last, y, z}; });
+            case Direction::Down: return has_transparent_block([](u32 x, u32 z) { return std::tuple {x, 0u, z}; });
+            case Direction::Up: return has_transparent_block([=](u32 x, u32 z) { return std::tuple {x, last, z}; });
+            case Direction::Back: return has_transparent_block([](u32 x, u32 y) { return std::tuple {x, y, 0u}; });
+            case Direction::Front: return has_transparent_block([=](u32 x, u32 y) { return std::tuple {x, y, last}; });
         }
-
-        if (has_transparent) m_portal_mask |= direction_bit(dir);
+        return false;
     }
 
     [[nodiscard]] constexpr bool has_portal(Direction direction) const
@@ -312,15 +281,139 @@ public:
         return (m_portal_mask & direction_bit(direction)) != 0u;
     }
 
-    constexpr void recalculate_portal_mask()
+    [[nodiscard]] constexpr u32 portal_connectivity() const { return m_portal_mask; }
+
+    constexpr void recalculate_portal_mask(bool full_3d_connectivity = true)
     {
-        m_portal_mask = 0;
-        for (Direction dir : ALL_DIRECTIONS) recalculate_single_face(dir);
+        u8 open_faces = 0u;
+        for (Direction dir : ALL_DIRECTIONS)
+            if (face_has_portal(dir)) open_faces |= direction_bit(dir);
+
+        if (open_faces == 0u)
+        {
+            m_portal_mask = 0u;
+            return;
+        }
+
+        if (std::popcount(open_faces) <= 1)
+        {
+            m_portal_mask = open_faces;
+            return;
+        }
+
+        const u32 max_connectivity = component_faces_to_connectivity(open_faces);
+        if (!full_3d_connectivity)
+        {
+            m_portal_mask = max_connectivity;
+            return;
+        }
+
+        constexpr u32 last = DIM - 1u;
+        constexpr u32 shift = static_cast<u32>(std::countr_zero(DIM));
+        constexpr u32 coord_mask = DIM - 1u;
+
+        std::array<u64, (VOLUME + 63u) / 64u> visited {};
+        std::array<u16, VOLUME> queue {};
+        u32 connectivity = open_faces;
+
+        auto try_visit = [&](u32 idx) -> bool {
+            const u32 word = idx >> 6u;
+            const u64 bit = 1ull << (idx & 63u);
+            if ((visited[word] & bit) != 0ull) return false;
+            visited[word] |= bit;
+            return true;
+        };
+
+        auto flood_from_seed = [&](u32 seed_idx) {
+            if (is_block_opaque(m_blocks[seed_idx]) || !try_visit(seed_idx)) return;
+
+            u8 comp_faces = 0u;
+            u32 head = 0u;
+            u32 tail = 0u;
+            queue[tail++] = static_cast<u16>(seed_idx);
+
+            while (head < tail)
+            {
+                const u32 cur = queue[head++];
+                const u32 x = cur & coord_mask;
+                const u32 y = (cur >> shift) & coord_mask;
+                const u32 z = cur >> (2u * shift);
+
+                if (x == 0u) comp_faces |= direction_bit(Direction::Left);
+                if (x == last) comp_faces |= direction_bit(Direction::Right);
+                if (y == 0u) comp_faces |= direction_bit(Direction::Down);
+                if (y == last) comp_faces |= direction_bit(Direction::Up);
+                if (z == 0u) comp_faces |= direction_bit(Direction::Back);
+                if (z == last) comp_faces |= direction_bit(Direction::Front);
+
+                if (x > 0u)
+                {
+                    const u32 n = cur - 1u;
+                    if (!is_block_opaque(m_blocks[n]) && try_visit(n)) queue[tail++] = static_cast<u16>(n);
+                }
+                if (x < last)
+                {
+                    const u32 n = cur + 1u;
+                    if (!is_block_opaque(m_blocks[n]) && try_visit(n)) queue[tail++] = static_cast<u16>(n);
+                }
+                if (y > 0u)
+                {
+                    const u32 n = cur - DIM;
+                    if (!is_block_opaque(m_blocks[n]) && try_visit(n)) queue[tail++] = static_cast<u16>(n);
+                }
+                if (y < last)
+                {
+                    const u32 n = cur + DIM;
+                    if (!is_block_opaque(m_blocks[n]) && try_visit(n)) queue[tail++] = static_cast<u16>(n);
+                }
+                if (z > 0u)
+                {
+                    const u32 n = cur - AREA;
+                    if (!is_block_opaque(m_blocks[n]) && try_visit(n)) queue[tail++] = static_cast<u16>(n);
+                }
+                if (z < last)
+                {
+                    const u32 n = cur + AREA;
+                    if (!is_block_opaque(m_blocks[n]) && try_visit(n)) queue[tail++] = static_cast<u16>(n);
+                }
+            }
+
+            connectivity |= component_faces_to_connectivity(comp_faces);
+        };
+
+        auto seed_face = [&]<typename CoordFn>(Direction dir, CoordFn get_coords) {
+            if ((open_faces & direction_bit(dir)) == 0u || connectivity == max_connectivity) return;
+            for (u32 a = 0; a < DIM && connectivity != max_connectivity; ++a)
+            {
+                for (u32 b = 0; b < DIM && connectivity != max_connectivity; ++b)
+                {
+                    const auto [x, y, z] = get_coords(a, b);
+                    flood_from_seed(get_index(x, y, z));
+                }
+            }
+        };
+
+        seed_face(Direction::Left, [](u32 y, u32 z) { return std::tuple {0u, y, z}; });
+        seed_face(Direction::Right, [=](u32 y, u32 z) { return std::tuple {last, y, z}; });
+        seed_face(Direction::Down, [](u32 x, u32 z) { return std::tuple {x, 0u, z}; });
+        seed_face(Direction::Up, [=](u32 x, u32 z) { return std::tuple {x, last, z}; });
+        seed_face(Direction::Back, [](u32 x, u32 y) { return std::tuple {x, y, 0u}; });
+        seed_face(Direction::Front, [=](u32 x, u32 y) { return std::tuple {x, y, last}; });
+
+        m_portal_mask = connectivity;
     }
 
-    constexpr void fill(BlockID id) { m_blocks.fill(id); }
+    constexpr void fill(BlockID id)
+    {
+        m_blocks.fill(id);
+        m_portal_mask = is_block_opaque(id) ? 0u : ALL_PORTAL_CONNECTIVITY;
+    }
 
-    constexpr void clear() { m_blocks.fill(BlockType::Air); }
+    constexpr void clear()
+    {
+        m_blocks.fill(BlockType::Air);
+        m_portal_mask = ALL_PORTAL_CONNECTIVITY;
+    }
 
     [[nodiscard]] constexpr u32 count_non_air_blocks() const
     {
@@ -342,8 +435,10 @@ public:
 
 private:
 
-    // 6 first bits: 1 if at least one non-opaque block for the corresponding face (L, R, D, U, B, F)
-    u8 m_portal_mask = 0b00111111;
+    // 21-bit face and face-pair portal connectivity mask:
+    //   Bits 0..5   -> open faces (L, R, D, U, B, F)
+    //   Bits 6..20  -> connected face pairs through non-opaque interior paths
+    u32 m_portal_mask = ALL_PORTAL_CONNECTIVITY;
 
     std::array<BlockID, VOLUME> m_blocks {};
 };

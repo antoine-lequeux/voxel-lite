@@ -12,15 +12,15 @@ namespace vl
 {
 
 inline constexpr i32 NEAR_RADIUS = 3;
+inline constexpr u32 MAX_WORKER_THREAD_COUNT = 4;
 
-// Per-frame budgets
-inline constexpr f64 SKY_AIR_TIME_BUDGET_MS = 2.0;
-inline constexpr f64 BFS_MIN_INTERVAL_MS = 250.0;
-inline constexpr u32 GEN_WORK_BUDGET_PER_FRAME = 4096;
-inline constexpr u32 MESH_WORK_BUDGET_PER_FRAME = 4096;
-inline constexpr u32 MAX_GEN_BATCH_CHUNKS = 2048;
-inline constexpr u32 MAX_MESH_BATCH_CHUNKS = 2048;
-inline constexpr u64 MAX_UPLOAD_BYTES_PER_FRAME = 16ull * 2048 * 2048;
+// Budgets
+inline constexpr f64 BFS_MIN_INTERVAL_MS = 50.0;
+inline constexpr u32 GEN_WORK_BUDGET_PER_BATCH = 2048;
+inline constexpr u32 MESH_WORK_BUDGET_PER_BATCH = 2048;
+inline constexpr u32 MAX_GEN_BATCH_CHUNKS = 64;
+inline constexpr u32 MAX_MESH_BATCH_CHUNKS = 64;
+inline constexpr u64 MAX_UPLOAD_BYTES_PER_FRAME = 16ull * 1024ull * 1024ull;
 
 [[nodiscard]] constexpr i32 length_squared(const glm::ivec3& v)
 {
@@ -82,7 +82,7 @@ public:
     [[nodiscard]] u32 get_air_chunks_count() const { return m_air_chunks_count; }
     [[nodiscard]] u32 get_pending_generation_count() const
     {
-        u32 total = 0;
+        u32 total = static_cast<u32>(m_gen_in_flight ? m_gen_batch.size() : 0u);
         for (const auto& q : m_gen_queues) total += static_cast<u32>(q.size());
         return total;
     }
@@ -163,6 +163,7 @@ public:
 private:
 
     using Clock = std::chrono::steady_clock;
+    using StagedChunkVariant = std::variant<Chunk<1>, Chunk<2>, Chunk<3>, Chunk<4>, Chunk<5>>;
 
     // Grid covering the maximum render window
     static constexpr i32 GRID_XZ = (2 * MAX_RENDER_DIST) + 1;
@@ -172,17 +173,17 @@ private:
     struct GridCell
     {
         static constexpr u32 TAG_UNLOADED = 0u;
-        static constexpr u32 ALL_PORTALS = 0b00111111u;
+        static constexpr u32 ALL_PORTALS = ALL_PORTAL_CONNECTIVITY;
 
         // Tag encoding (4 bits):
         //   0                            = unloaded
         //   1..MAX_LOD                   = real chunk at LOD 'tag'
         //   (MAX_LOD + 1)..(2 * MAX_LOD) = air chunk evaluated at LOD 'tag - MAX_LOD' (1 = guaranteed air at all LODs)
         u32 tag : 4 = TAG_UNLOADED;
-        u32 portal_mask : 6 = 0u;
-        u32 index : 22 = 0u;
+        u32 reached_faces : 6 = 0u;
+        u32 frontier_stamp : 22 = 0u;
+        u32 index = 0u;
         u32 loaded_epoch = 0u;
-        u32 frontier_stamp = 0u;
 
         [[nodiscard]] constexpr bool is_unloaded() const { return tag == TAG_UNLOADED; }
         [[nodiscard]] constexpr bool is_real() const { return tag >= 1u && tag <= MAX_LOD; }
@@ -195,34 +196,34 @@ private:
             if (is_air()) return target_lod < lod();
             return false;
         }
-
-        [[nodiscard]] constexpr u16 pack_bfs_state() const { return static_cast<u16>((portal_mask << 4u) | tag); }
     };
 
-    // BFS queue entry supporting render distances up to 2047 chunks
+    static_assert(sizeof(GridCell) == 12);
+
     struct SearchNode
     {
-        i32 dx : 12;
-        i32 dz : 12;
-        i32 y : 8;
+        i16 dx = 0;
+        i16 dz = 0;
+        i16 y = 0;
+        u8 out_dirs = 0u;
+        u8 pad = 0u;
     };
 
-    static_assert(sizeof(SearchNode) == 4);
+    static_assert(sizeof(SearchNode) == 8);
 
     struct GenTaskItem
     {
         glm::ivec3 coord {};
-        u32 slot = 0;
         i32 column_max_height = 0;
+        u32 old_portal_mask = 0;
+        u32 portal_mask = 0;
         u8 target_lod = 1;
-        u8 old_portal_mask = 0;
         bool was_unloaded = false;
-        bool was_real = false;
-        bool had_old_mesh = false;
         bool high_priority = false;
         bool non_air = false;
         bool guaranteed_all_lods = false;
-        u8 portal_mask = 0;
+        bool committed = false;
+        StagedChunkVariant staged_chunk {Chunk<5> {}};
     };
 
     struct MeshTaskItem
@@ -231,6 +232,7 @@ private:
         u32 slot = 0;
         u8 lod = 1;
         ChunkNeighbors neighbors {};
+        ChunkMesh staged_mesh {};
     };
 
     struct BackgroundBfsTask : enki::ITaskSet
@@ -241,6 +243,53 @@ private:
 
         void ExecuteRange(enki::TaskSetPartition, u32) override { manager->execute_background_bfs(); }
     };
+
+    struct BackgroundGenTask : enki::ITaskSet
+    {
+        WorldManager* manager = nullptr;
+
+        explicit BackgroundGenTask(WorldManager* mgr) : enki::ITaskSet(1), manager(mgr) { m_Priority = enki::TASK_PRIORITY_MED; }
+
+        void ExecuteRange(enki::TaskSetPartition range, u32 threadnum) override
+        {
+            manager->execute_background_gen(range, threadnum);
+        }
+    };
+
+    struct BackgroundMeshTask : enki::ITaskSet
+    {
+        WorldManager* manager = nullptr;
+
+        explicit BackgroundMeshTask(WorldManager* mgr) : enki::ITaskSet(1), manager(mgr)
+        {
+            m_Priority = enki::TASK_PRIORITY_HIGH;
+        }
+
+        void ExecuteRange(enki::TaskSetPartition range, u32 threadnum) override
+        {
+            manager->execute_background_mesh(range, threadnum);
+        }
+    };
+
+    template <u32 Lod>
+    [[nodiscard]] static StagedChunkVariant init_staged_chunk(const glm::ivec3& coord)
+    {
+        StagedChunkVariant v {std::in_place_type<Chunk<Lod>>};
+        std::get<Chunk<Lod>>(v).coord = coord;
+        return v;
+    }
+
+    [[nodiscard]] static StagedChunkVariant make_staged_chunk(u8 lod, const glm::ivec3& coord)
+    {
+        switch (lod)
+        {
+            case 1: return init_staged_chunk<1>(coord);
+            case 2: return init_staged_chunk<2>(coord);
+            case 3: return init_staged_chunk<3>(coord);
+            case 4: return init_staged_chunk<4>(coord);
+            default: return init_staged_chunk<5>(coord);
+        }
+    }
 
     [[nodiscard]] static constexpr i32 wrap_xz(i32 v)
     {
@@ -253,6 +302,20 @@ private:
         return static_cast<u32>((((c.y - MIN_CHUNK_Y) * GRID_XZ + wrap_xz(c.z)) * GRID_XZ) + wrap_xz(c.x));
     }
 
+    [[nodiscard]] static constexpr u32 pack_bfs_state(u32 tag, u32 portals)
+    {
+        return ((portals & GridCell::ALL_PORTALS) << 4u) | (tag & 0xFu);
+    }
+
+    [[nodiscard]] u32 cell_portal_mask(u32 idx) const { return (m_cell_bfs_state[idx] >> 4u) & GridCell::ALL_PORTALS; }
+
+    u32 next_frontier_stamp()
+    {
+        m_frontier_stamp = (m_frontier_stamp + 1u) & 0x3FFFFFu;
+        if (m_frontier_stamp == 0u) m_frontier_stamp = 1u;
+        return m_frontier_stamp;
+    }
+
     [[nodiscard]] bool is_in_active_window(const glm::ivec3& c) const
     {
         if (!m_has_last_origin || !is_y_in_world(c.y)) return false;
@@ -263,7 +326,7 @@ private:
     void clear_cell(u32 idx, GridCell& cell)
     {
         cell.tag = GridCell::TAG_UNLOADED;
-        cell.portal_mask = 0u;
+        cell.reached_faces = 0u;
         cell.index = 0u;
         m_cell_bfs_state[idx] = 0u;
     }
@@ -271,26 +334,23 @@ private:
     void set_cell_air(u32 idx, GridCell& cell, u8 air_lod)
     {
         cell.tag = static_cast<u32>(MAX_LOD + air_lod);
-        cell.portal_mask = GridCell::ALL_PORTALS;
         cell.index = 0u;
         cell.loaded_epoch = ++m_current_epoch;
-        m_cell_bfs_state[idx] = cell.pack_bfs_state();
+        m_cell_bfs_state[idx] = pack_bfs_state(cell.tag, GridCell::ALL_PORTALS);
     }
 
-    void set_cell_real(u32 idx, GridCell& cell, u8 chunk_lod, u32 pool_slot, u8 portals)
+    void set_cell_real(u32 idx, GridCell& cell, u8 chunk_lod, u32 pool_slot, u32 portals)
     {
         cell.tag = chunk_lod;
-        cell.portal_mask = portals & GridCell::ALL_PORTALS;
         cell.index = pool_slot;
         cell.loaded_epoch = ++m_current_epoch;
-        m_cell_bfs_state[idx] = cell.pack_bfs_state();
+        m_cell_bfs_state[idx] = pack_bfs_state(cell.tag, portals);
     }
 
-    void update_cell_portals(u32 idx, GridCell& cell, u8 portals)
+    void update_cell_portals(u32 idx, GridCell& cell, u32 portals)
     {
-        cell.portal_mask = portals & GridCell::ALL_PORTALS;
         cell.loaded_epoch = ++m_current_epoch;
-        m_cell_bfs_state[idx] = cell.pack_bfs_state();
+        m_cell_bfs_state[idx] = pack_bfs_state(cell.tag, portals);
     }
 
     [[nodiscard]] const GridCell* find_real_cell(const glm::ivec3& coord) const
@@ -332,22 +392,30 @@ private:
     }
 
     template <typename ChunkT>
-    [[nodiscard]] static constexpr u8 extract_portal_mask(const ChunkT& chunk)
+    [[nodiscard]] static constexpr u32 extract_portal_mask(const ChunkT& chunk)
     {
-        u8 mask = 0;
-        for (Direction dir : ALL_DIRECTIONS)
-            if (chunk.has_portal(dir)) mask |= direction_bit(dir);
-        return mask;
+        return chunk.portal_connectivity();
     }
+
+    void wait_for_all_tasks();
 
     void start_background_bfs(const glm::ivec3& origin, i32 rd);
     void harvest_background_bfs(const glm::ivec3& origin, vulk::VulkanContext& ctx);
     void execute_background_bfs();
 
+    void start_background_gen(const glm::ivec3& origin);
+    void harvest_background_gen(const glm::ivec3& origin, i32 rd, vulk::VulkanContext& ctx);
+    void execute_background_gen(enki::TaskSetPartition range, u32 threadnum);
+
+    void start_background_mesh();
+    void harvest_background_mesh(vulk::VulkanContext& ctx);
+    void execute_background_mesh(enki::TaskSetPartition range, u32 threadnum);
+
+    // Computes the outgoing directions of 'cell' that are connected to its reached entry faces (or all open faces at origin)
+    [[nodiscard]] u8 compute_allowed_out_dirs(const glm::ivec3& coord, u32 idx, GridCell& cell, const glm::ivec3& origin) const;
+
     // Returns true if at least one unloaded neighbor was newly queued
-    bool expand_frontier_from(
-        const glm::ivec3& coord, const GridCell& start_cell, const glm::ivec3& origin, i32 rd, bool high_priority = false
-    );
+    bool expand_frontier_from(const glm::ivec3& coord, const glm::ivec3& origin, i32 rd, bool high_priority = false);
 
     // Fills all unloaded air chunks in a column strictly above 'col_max_height' and expands their frontier
     void fill_air_column_above(i32 cx, i32 cz, i32 col_max_height, const glm::ivec3& origin, i32 rd);
@@ -356,21 +424,19 @@ private:
     void unload_cell_at(const glm::ivec3& coord, vulk::VulkanContext& ctx);
     void unload_out_of_range(const glm::ivec3& new_origin, i32 new_rd, vulk::VulkanContext& ctx);
 
-    void generate_wanted_chunks(const glm::ivec3& origin, i32 rd, vulk::VulkanContext& ctx);
     void on_chunk_loaded(const glm::ivec3& coord, bool high_priority = false);
     void mark_dirty(const glm::ivec3& coord);
-    void process_mesh_queues(vulk::VulkanContext& ctx);
 
     // Spatial grid (main thread)
     std::unique_ptr<GridCell[]> m_grid {};
-    std::unique_ptr<u16[]> m_cell_bfs_state {};
+    std::unique_ptr<u32[]> m_cell_bfs_state {};
     u32 m_current_epoch = 0;
     u32 m_frontier_stamp = 1;
     u32 m_air_chunks_count = 0;
 
     // Background BFS state (isolated from main thread)
     BackgroundBfsTask m_bfs_task;
-    std::unique_ptr<u16[]> m_bfs_snapshot {};
+    std::unique_ptr<u32[]> m_bfs_snapshot {};
     std::unique_ptr<u64[]> m_bfs_visited_bits {};
     std::vector<SearchNode> m_bfs_queue {};
     std::vector<glm::ivec3> m_bfs_out_candidates {};
@@ -382,10 +448,17 @@ private:
     bool m_bfs_needs_rerun = false;
     Clock::time_point m_last_bfs_time {};
 
+    // Background generation and meshing state
+    BackgroundGenTask m_gen_task;
+    BackgroundMeshTask m_mesh_task;
+    bool m_gen_in_flight = false;
+    bool m_mesh_in_flight = false;
+
     // Per-LOD generation and meshing queues (index 0 = LOD 1, index MAX_LOD-1 = LOD 5)
     std::deque<glm::ivec3> m_urgent_gen_queue {};
     std::array<std::deque<glm::ivec3>, MAX_LOD> m_gen_queues {};
     std::vector<glm::ivec3> m_frontier_during_bfs {};
+    std::vector<SearchNode> m_expand_stack {};
     std::vector<glm::ivec3> m_near_offsets {};
     glm::ivec3 m_last_origin {0, 0, 0};
     i32 m_last_render_distance = 0;
@@ -400,6 +473,7 @@ private:
     std::vector<ChunkGenerator> m_worker_generators {};
     std::vector<GenTaskItem> m_gen_batch {};
     std::vector<MeshTaskItem> m_mesh_batch {};
+    std::array<std::vector<PackedVertex>, MAX_MESH_BATCH_CHUNKS> m_mesh_vertex_scratch {};
 
     // Per-LOD chunk pools
     LodPoolGroup m_pools {};

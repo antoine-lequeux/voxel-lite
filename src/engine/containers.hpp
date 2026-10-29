@@ -19,9 +19,9 @@ inline constexpr i32 DEFAULT_RENDER_DIST = 128;
 
 // Half extents (in chunks) of the box around the camera chunk for each LOD
 inline constexpr std::array<i32, MAX_LOD> LOD_BOX_RADII = {
-    16,              // LOD 1
-    32,              // LOD 2
-    64,              // LOD 3
+    24,              // LOD 1
+    48,              // LOD 2
+    96,              // LOD 3
     128,             // LOD 4
     MAX_RENDER_DIST, // LOD 5
 };
