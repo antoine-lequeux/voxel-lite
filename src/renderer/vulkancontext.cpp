@@ -1804,7 +1804,6 @@ BufferHandle VulkanContext::get_or_create_quad_index_buffer(u32 max_quads)
     return m_impl->quad_index_buffer;
 }
 
-
 ShaderHandle VulkanContext::create_shader_from_file(std::string_view filepath)
 {
     if (m_impl == nullptr || filepath.empty()) return ShaderHandle::invalid();
@@ -2079,7 +2078,6 @@ void VulkanContext::push_constants(const void* data, u32 size_bytes, u32 offset_
     VkCommandBuffer cmd = m_impl->frames[m_impl->current_frame_index].cmd;
     vkCmdPushConstants(cmd, m_impl->global_pipeline_layout, VK_SHADER_STAGE_ALL, offset_bytes, clamped_size, data);
 }
-
 
 void VulkanContext::bind_index_buffer_u32(BufferHandle buffer, u64 offset_bytes)
 {
