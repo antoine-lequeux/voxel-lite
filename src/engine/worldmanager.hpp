@@ -1,6 +1,6 @@
 #pragma once
 
-#include "chunkgenerator.hpp"
+#include "generation/chunkgenerator.hpp"
 #include "containers.hpp"
 
 #include <TaskScheduler.h>

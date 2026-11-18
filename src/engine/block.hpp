@@ -125,7 +125,8 @@ inline constexpr BlockID Water = 5;
 inline constexpr BlockID Snow = 6;
 inline constexpr BlockID Wood = 7;
 inline constexpr BlockID Leaves = 8;
-inline constexpr u16 Count = 9;
+inline constexpr BlockID Clay = 9;
+inline constexpr u16 Count = 10;
 } // namespace BlockType
 
 enum class Visibility : u8
@@ -257,6 +258,15 @@ inline constexpr std::array<BlockDef, BlockType::Count> BLOCK_REGISTRY {{
         .is_solid = true,
         .visibility = Visibility::Cutout,
         .light_opacity = 4,
+        .light_emission = 0,
+    },
+    {
+        .name = "Clay",
+        .face_colors = BlockDef::uniform_colors({0.58f, 0.62f, 0.68f}),
+        .roughness = 0.82f,
+        .is_solid = true,
+        .visibility = Visibility::Opaque,
+        .light_opacity = 15,
         .light_emission = 0,
     },
 }};
