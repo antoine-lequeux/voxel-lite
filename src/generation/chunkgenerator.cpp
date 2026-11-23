@@ -33,7 +33,8 @@ const ChunkGenerator::ColumnInfo& ChunkGenerator::compute_column(i32 cx, i32 cz,
     const i32 dim = CHUNK_SIZE >> shift;
     const i32 scale = 1 << shift;
 
-    constexpr i32 pad = world_config::COLUMN_PADDING;
+    const i32 canopy_cells = (lod <= world_config::MAX_TREE_LOD) ? ((world_config::TREE_CANOPY_RADIUS + scale - 1) / scale) : 0;
+    const i32 pad = std::min(world_config::COLUMN_PADDING, canopy_cells + 1);
     const i32 padded_dim = dim + (2 * pad);
     const usize padded_count = static_cast<usize>(padded_dim * padded_dim);
 
@@ -95,8 +96,6 @@ const ChunkGenerator::ColumnInfo& ChunkGenerator::compute_column(i32 cx, i32 cz,
 
     if (lod <= world_config::MAX_TREE_LOD)
     {
-        const i32 canopy_cells = (world_config::TREE_CANOPY_RADIUS + scale - 1) / scale;
-
         for (i32 pz = 1; pz < padded_dim - 1; ++pz)
         {
             const i32 local_z = pz - pad;
@@ -245,9 +244,12 @@ bool ChunkGenerator::generate(Chunk<Lod>& chunk, bool& out_guaranteed_all_lods, 
 
     // Pre-generate the 2 3D cave noise grids in SIMD for the Y slices that overlap ground level
     i32 cave_y_count = 0;
+    bool evaluate_caves = false;
     if constexpr (Lod <= world_config::MAX_CAVE_LOD)
     {
-        if (base_y <= info.max_height)
+        const bool underwater_protected = (info.max_height <= world_config::SEA_LEVEL + 3) &&
+                                          (base_y > info.max_height - world_config::CAVE_UNDERWATER_ROOF_DEPTH);
+        if (base_y <= info.max_height && !underwater_protected)
         {
             const i32 max_ground_ly = std::min((info.max_height - base_y) / scale, static_cast<i32>(dim) - 1);
             // Include 1 extra slice (+2) so checking whether (ly + 1) is carved is always in bounds
@@ -258,15 +260,35 @@ bool ChunkGenerator::generate(Chunk<Lod>& chunk, bool& out_guaranteed_all_lods, 
             const f32 start_z = static_cast<f32>(chunk.coord.z * CHUNK_SIZE);
             const f32 step = static_cast<f32>(scale);
 
-            m_nodes.cave_spaghetti_3d->GenUniformGrid3D(
-                m_cave_spaghetti_buf.data(), start_x, start_y, start_z, static_cast<i32>(dim), cave_y_count,
-                static_cast<i32>(dim), step, step, step, m_seed
-            );
-
             m_nodes.cave_large_3d->GenUniformGrid3D(
                 m_cave_large_buf.data(), start_x, start_y, start_z, static_cast<i32>(dim), cave_y_count, static_cast<i32>(dim),
                 step, step, step, m_seed
             );
+
+            // In the surface crust, skip the spaghetti 3D noise where no cave can generate
+            bool need_spaghetti_grid = true;
+            if (base_y > info.max_height - world_config::CAVE_SURFACE_ROOF_DEPTH)
+            {
+                need_spaghetti_grid = false;
+                const usize total_samples = static_cast<usize>(dim) * static_cast<usize>(cave_y_count) * static_cast<usize>(dim);
+                for (usize i = 0; i < total_samples; ++i)
+                {
+                    if (m_cave_large_buf[i] >= world_config::CAVE_ENTRANCE_RARITY_THRESHOLD)
+                    {
+                        need_spaghetti_grid = true;
+                        break;
+                    }
+                }
+            }
+
+            if (need_spaghetti_grid)
+            {
+                m_nodes.cave_spaghetti_3d->GenUniformGrid3D(
+                    m_cave_spaghetti_buf.data(), start_x, start_y, start_z, static_cast<i32>(dim), cave_y_count,
+                    static_cast<i32>(dim), step, step, step, m_seed
+                );
+                evaluate_caves = true;
+            }
         }
     }
 
@@ -303,7 +325,8 @@ bool ChunkGenerator::generate(Chunk<Lod>& chunk, bool& out_guaranteed_all_lods, 
 
                     if constexpr (Lod <= world_config::MAX_CAVE_LOD)
                     {
-                        if (is_cave_carved(m_cave_spaghetti_buf[cave_idx], m_cave_large_buf[cave_idx], col_height, depth))
+                        if (evaluate_caves &&
+                            is_cave_carved(m_cave_spaghetti_buf[cave_idx], m_cave_large_buf[cave_idx], col_height, depth))
                         {
                             any_cave_carved = true;
                             continue;
@@ -313,7 +336,7 @@ bool ChunkGenerator::generate(Chunk<Lod>& chunk, bool& out_guaranteed_all_lods, 
                     bool has_solid_above = (wy + scale <= col_height);
                     if constexpr (Lod <= world_config::MAX_CAVE_LOD)
                     {
-                        if (has_solid_above)
+                        if (evaluate_caves && has_solid_above)
                         {
                             const usize above_idx = cave_idx + dim;
                             has_solid_above = !is_cave_carved(

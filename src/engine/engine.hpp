@@ -11,8 +11,8 @@ namespace vl
 namespace AppConfig
 {
 inline constexpr const char* NAME = "Voxel Lite";
-inline constexpr u32 VERSION_MAJOR = 0;
-inline constexpr u32 VERSION_MINOR = 5;
+inline constexpr u32 VERSION_MAJOR = 1;
+inline constexpr u32 VERSION_MINOR = 0;
 inline constexpr u32 VERSION_PATCH = 0;
 } // namespace AppConfig
 

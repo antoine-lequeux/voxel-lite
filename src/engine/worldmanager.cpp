@@ -22,9 +22,12 @@ WorldManager::WorldManager(i32 seed)
     m_bfs_out_candidates.reserve(65536);
     m_bfs_out_unwanted.reserve(4096);
 
+    m_reordered_candidates.reserve(32768);
+    m_deferred_remeshes.reserve(512);
     m_frontier_during_bfs.reserve(16384);
     m_expand_stack.reserve(1024);
     m_gen_batch.reserve(MAX_GEN_BATCH_CHUNKS);
+    m_gen_worker_order.reserve(MAX_GEN_BATCH_CHUNKS);
     m_mesh_batch.reserve(MAX_MESH_BATCH_CHUNKS);
 
     // Near-region offsets sorted by distance so the closest chunks are generated first
@@ -71,7 +74,8 @@ bool WorldManager::unload_chunk(const glm::ivec3& coord, vulk::VulkanContext& ct
     if (m_mesh_in_flight)
     {
         m_scheduler.WaitforTask(&m_mesh_task);
-        harvest_background_mesh(ctx);
+        u64 uploaded_bytes = 0;
+        harvest_background_mesh(ctx, uploaded_bytes);
     }
 
     if (!is_in_active_window(coord)) return false;
@@ -161,13 +165,171 @@ void WorldManager::set_world_block(i32 wx, i32 wy, i32 wz, BlockID id)
     if (lz_m == last_m) mark_dirty(chunk_coord + to_offset(Direction::Front));
 }
 
+void WorldManager::refresh_queues_for_new_origin(
+    const glm::ivec3& old_origin, const glm::ivec3& new_origin, i32 rd, bool had_old_origin
+)
+{
+    GridCell* const grid = m_grid.get();
+    m_reordered_candidates.clear();
+
+    // Collect all pending generation candidates so they can be rebucketed and sorted for the new origin
+    for (auto& q : m_gen_queues)
+    {
+        for (const glm::ivec3& c : q)
+            if (is_in_active_window(c)) m_reordered_candidates.push_back(c);
+        q.clear();
+    }
+
+    // Detect inner ring chunks (LOD 1..3) entering or leaving an LOD box
+    // so inner ring LOD transitions start on the exact frame the camera crosses a chunk boundary
+    if (had_old_origin)
+    {
+        auto scan_box_diff = [&](const glm::ivec3& box_a, const glm::ivec3& box_b, i32 r) {
+            const i32 a_min_x = std::max(new_origin.x - rd, box_a.x - r);
+            const i32 a_max_x = std::min(new_origin.x + rd, box_a.x + r);
+            const i32 a_min_y = std::max(MIN_CHUNK_Y, box_a.y - r);
+            const i32 a_max_y = std::min(MAX_CHUNK_Y, box_a.y + r);
+            const i32 a_min_z = std::max(new_origin.z - rd, box_a.z - r);
+            const i32 a_max_z = std::min(new_origin.z + rd, box_a.z + r);
+
+            const i32 b_min_x = box_b.x - r;
+            const i32 b_max_x = box_b.x + r;
+            const i32 b_min_y = box_b.y - r;
+            const i32 b_max_y = box_b.y + r;
+            const i32 b_min_z = box_b.z - r;
+            const i32 b_max_z = box_b.z + r;
+
+            for (i32 cy = a_min_y; cy <= a_max_y; ++cy)
+            {
+                const bool y_in_b = (cy >= b_min_y && cy <= b_max_y);
+                for (i32 cz = a_min_z; cz <= a_max_z; ++cz)
+                {
+                    const bool yz_in_b = y_in_b && (cz >= b_min_z && cz <= b_max_z);
+                    for (i32 cx = a_min_x; cx <= a_max_x; ++cx)
+                    {
+                        if (yz_in_b && cx >= b_min_x && cx <= b_max_x)
+                        {
+                            cx = b_max_x;
+                            continue;
+                        }
+
+                        const glm::ivec3 c {cx, cy, cz};
+                        const GridCell& cell = grid[cell_index(c)];
+                        const u8 target_lod = compute_lod(c, new_origin);
+                        if (cell.needs_lod_update(target_lod) || (cell.is_unloaded() && cell.reached_faces != 0u))
+                            m_reordered_candidates.push_back(c);
+                    }
+                }
+            }
+        };
+
+        for (u32 lod = 1; lod <= 3u; ++lod)
+        {
+            const i32 r = std::min(rd, LOD_BOX_RADII[lod - 1u]);
+            scan_box_diff(new_origin, old_origin, r);
+            scan_box_diff(old_origin, new_origin, r);
+        }
+    }
+
+    const u32 stamp = next_frontier_stamp();
+
+    auto enqueue_unique = [&](const glm::ivec3& c) {
+        if (!is_in_active_window(c)) return;
+        GridCell& cell = grid[cell_index(c)];
+        if (cell.frontier_stamp == stamp) return;
+
+        const u8 target_lod = compute_lod(c, new_origin);
+        if (!cell.is_unloaded() && !cell.needs_lod_update(target_lod)) return;
+
+        cell.frontier_stamp = stamp;
+        m_gen_queues[target_lod - 1u].push_back(c);
+    };
+
+    // Seed the immediate near-camera sphere first and ensure their inward faces are marked reached
+    for (const glm::ivec3& off : m_near_offsets)
+    {
+        const i32 y = new_origin.y + off.y;
+        if (!is_y_in_world(y) || std::abs(off.x) > rd || std::abs(off.z) > rd) continue;
+        const glm::ivec3 c {new_origin.x + off.x, y, new_origin.z + off.z};
+        grid[cell_index(c)].reached_faces |= inward_faces_toward_origin(c, new_origin);
+        enqueue_unique(c);
+    }
+
+    // Re-enqueue all remaining valid candidates into their updated LOD queues
+    for (const glm::ivec3& c : m_reordered_candidates) enqueue_unique(c);
+    m_reordered_candidates.clear();
+
+    // Sort the inner ring generation and mesh queues by distance to the new origin so closest chunks always come first
+    auto by_dist = [&](const glm::ivec3& c) { return distance_squared(c, new_origin); };
+    for (u32 lod = 1; lod <= 3u; ++lod) std::ranges::stable_sort(m_gen_queues[lod - 1u], {}, by_dist);
+    for (u32 lod = 1; lod <= 2u; ++lod)
+    {
+        std::ranges::stable_sort(m_remesh_queues[lod - 1u], {}, by_dist);
+        std::ranges::stable_sort(m_mesh_queues[lod - 1u], {}, by_dist);
+    }
+}
+
+void WorldManager::sync_cell_reached_from_neighbors(const glm::ivec3& coord, GridCell& cell, const glm::ivec3& origin)
+{
+    if (is_in_near_radius(coord, origin)) cell.reached_faces |= inward_faces_toward_origin(coord, origin);
+
+    for (Direction d : ALL_DIRECTIONS)
+    {
+        const glm::ivec3 ncoord = coord + to_offset(d);
+        if (!is_in_active_window(ncoord)) continue;
+
+        const u32 nidx = cell_index(ncoord);
+        GridCell& ncell = m_grid[nidx];
+        if (ncell.is_unloaded()) continue;
+
+        const u8 n_out = compute_allowed_out_dirs(ncoord, nidx, ncell, origin);
+        if ((n_out & direction_bit(opposite(d))) != 0u) cell.reached_faces |= direction_bit(d);
+    }
+}
+
+bool WorldManager::has_unloaded_portal_neighbor(const glm::ivec3& coord, u32 idx, GridCell& cell, const glm::ivec3& origin)
+{
+    const u8 allowed_out = compute_allowed_out_dirs(coord, idx, cell, origin);
+    if (allowed_out == 0u) return false;
+
+    bool any_unloaded = false;
+    for (Direction d : ALL_DIRECTIONS)
+    {
+        if ((allowed_out & direction_bit(d)) == 0u) continue;
+
+        const glm::ivec3 ncoord = coord + to_offset(d);
+        if (!is_in_active_window(ncoord)) continue;
+
+        GridCell& ncell = m_grid[cell_index(ncoord)];
+        if (ncell.is_unloaded())
+        {
+            any_unloaded = true;
+            ncell.reached_faces |= direction_bit(opposite(d));
+            if (ncell.frontier_stamp != m_frontier_stamp)
+            {
+                ncell.frontier_stamp = m_frontier_stamp;
+                const u8 target_lod = compute_lod(ncoord, origin);
+                m_urgent_gen_queue.push_back(ncoord);
+                m_gen_queues[target_lod - 1u].push_front(ncoord);
+                if (m_bfs_in_flight) m_frontier_during_bfs.push_back(ncoord);
+            }
+        }
+    }
+    return any_unloaded;
+}
+
 void WorldManager::update(const glm::vec3& cam_world_pos, vulk::VulkanContext& ctx)
 {
-    // Harvest completed background meshes first
+    const auto frame_start = Clock::now();
+    auto elapsed_ms = [&]() -> f64 { return std::chrono::duration<f64, std::milli>(Clock::now() - frame_start).count(); };
+
+    u64 uploaded_bytes = 0;
+
+    // Harvest any background mesh batch that was running asynchronously during rendering/present
     if (m_mesh_in_flight)
     {
-        if (!m_mesh_task.GetIsComplete()) return;
-        harvest_background_mesh(ctx);
+        m_scheduler.WaitforTask(&m_mesh_task, enki::TASK_PRIORITY_HIGH);
+        harvest_background_mesh(ctx, uploaded_bytes);
     }
 
     const i32 rd = m_render_distance;
@@ -185,6 +347,9 @@ void WorldManager::update(const glm::vec3& cam_world_pos, vulk::VulkanContext& c
         first_frame || origin.x != m_last_origin.x || origin.z != m_last_origin.z || rd != m_last_render_distance;
     const bool origin_changed = window_changed || origin.y != m_last_origin.y;
 
+    const glm::ivec3 old_origin = m_last_origin;
+    const bool had_old_origin = m_has_last_origin;
+
     // Out-of-range chunks are unloaded before updating the active window
     if (window_changed && m_has_last_origin) unload_out_of_range(origin, rd, ctx);
 
@@ -196,32 +361,34 @@ void WorldManager::update(const glm::vec3& cam_world_pos, vulk::VulkanContext& c
     {
         m_search_dirty = true;
         if (m_bfs_in_flight) m_bfs_needs_rerun = true;
-
-        if (is_y_in_world(origin.y)) m_grid[cell_index(origin)].reached_faces = ALL_OPEN_FACES_MASK;
-
-        // Prioritize the immediate neighborhood around the new camera origin at the front of the LOD queues
-        const u32 stamp = next_frontier_stamp();
-        for (usize i = m_near_offsets.size(); i > 0u; --i)
-        {
-            const glm::ivec3& off = m_near_offsets[i - 1u];
-            const i32 y = origin.y + off.y;
-            if (!is_y_in_world(y) || std::abs(off.x) > rd || std::abs(off.z) > rd) continue;
-            const glm::ivec3 c {origin.x + off.x, y, origin.z + off.z};
-            GridCell& cell = m_grid[cell_index(c)];
-            const u8 lod = compute_lod(c, origin);
-            if (cell.is_unloaded() || cell.needs_lod_update(lod))
-            {
-                cell.frontier_stamp = stamp;
-                m_gen_queues[lod - 1u].push_front(c);
-            }
-        }
+        refresh_queues_for_new_origin(old_origin, origin, rd, had_old_origin);
     }
 
     // Harvest completed background BFS results without blocking
     if (m_bfs_in_flight && m_bfs_task.GetIsComplete()) harvest_background_bfs(origin, ctx);
 
-    // Harvest completed background chunk generation batch without blocking
-    if (m_gen_in_flight && m_gen_task.GetIsComplete()) harvest_background_gen(origin, rd, ctx);
+    // Harvest any background generation batch that was running asynchronously during rendering/present
+    if (m_gen_in_flight)
+    {
+        m_scheduler.WaitforTask(&m_gen_task, enki::TASK_PRIORITY_HIGH);
+        harvest_background_gen(origin, rd, ctx);
+    }
+
+    // Execute parallel generation micro-batches within the frame's generation time budget
+    while (!m_gen_in_flight && elapsed_ms() < GEN_TIME_BUDGET_MS)
+    {
+        if (!start_background_gen(origin, false)) break;
+        m_scheduler.WaitforTask(&m_gen_task, enki::TASK_PRIORITY_HIGH);
+        harvest_background_gen(origin, rd, ctx);
+    }
+
+    // Immediately generate any urgent neighbor chunks revealed by LOD transitions so no holes appear
+    while (!m_gen_in_flight && !m_urgent_gen_queue.empty() && elapsed_ms() < (GEN_TIME_BUDGET_MS + URGENT_GEN_EXTRA_BUDGET_MS))
+    {
+        if (!start_background_gen(origin, true)) break;
+        m_scheduler.WaitforTask(&m_gen_task, enki::TASK_PRIORITY_HIGH);
+        harvest_background_gen(origin, rd, ctx);
+    }
 
     // Launch a new background BFS when camera origin changed or portal topology changed
     if (!m_bfs_in_flight && m_search_dirty)
@@ -231,9 +398,17 @@ void WorldManager::update(const glm::vec3& cam_world_pos, vulk::VulkanContext& c
         if (origin_changed || first_frame || since_last_ms >= BFS_MIN_INTERVAL_MS) start_background_bfs(origin, rd);
     }
 
-    // Launch next background chunk generation and meshing batches on worker threads without waiting
-    if (!m_gen_in_flight) start_background_gen(origin);
-    if (!m_mesh_in_flight) start_background_mesh();
+    // Execute parallel meshing micro-batches within the remaining frame work time budget
+    while (!m_mesh_in_flight && uploaded_bytes < MAX_UPLOAD_BYTES_PER_FRAME && elapsed_ms() < FRAME_WORK_TIME_BUDGET_MS)
+    {
+        if (!start_background_mesh(origin)) break;
+        m_scheduler.WaitforTask(&m_mesh_task, enki::TASK_PRIORITY_HIGH);
+        harvest_background_mesh(ctx, uploaded_bytes);
+    }
+
+    // Kick off one asynchronous generation batch and mesh batch to keep worker threads busy during GPU rendering/present
+    if (!m_gen_in_flight) start_background_gen(origin, false);
+    if (!m_mesh_in_flight && uploaded_bytes < MAX_UPLOAD_BYTES_PER_FRAME) start_background_mesh(origin);
 }
 
 void WorldManager::start_background_bfs(const glm::ivec3& origin, i32 rd)
@@ -284,12 +459,7 @@ void WorldManager::harvest_background_bfs(const glm::ivec3& origin, vulk::Vulkan
     for (const glm::ivec3& coord : m_bfs_out_unwanted)
     {
         if (!is_in_active_window(coord)) continue;
-
-        if (std::abs(coord.x - origin.x) <= NEAR_RADIUS && std::abs(coord.y - origin.y) <= NEAR_RADIUS &&
-            std::abs(coord.z - origin.z) <= NEAR_RADIUS)
-        {
-            continue;
-        }
+        if (is_in_near_radius(coord, origin)) continue;
 
         const u32 idx = cell_index(coord);
         GridCell& cell = m_grid[idx];
@@ -341,10 +511,20 @@ void WorldManager::harvest_background_bfs(const glm::ivec3& origin, vulk::Vulkan
 
     for (const glm::ivec3& c : m_bfs_out_candidates) sync_reached(c);
 
-    // Sort any frontier candidates discovered on the main thread while the BFS was running so closest come first
-    std::ranges::stable_sort(m_frontier_during_bfs, {}, [&](const glm::ivec3& c) { return distance_squared(c, origin); });
+    // Preserve any existing high priority inner ring candidates if the camera moved while the BFS was running
+    m_reordered_candidates.clear();
     if (origin != m_bfs_origin)
+    {
+        for (u32 lod = 1; lod <= 3u; ++lod)
+        {
+            for (const glm::ivec3& c : m_gen_queues[lod - 1u])
+                if (is_in_active_window(c)) m_reordered_candidates.push_back(c);
+        }
+        std::ranges::stable_sort(m_reordered_candidates, {}, [&](const glm::ivec3& c) { return distance_squared(c, origin); });
         std::ranges::stable_sort(m_bfs_out_candidates, {}, [&](const glm::ivec3& c) { return distance_squared(c, origin); });
+    }
+
+    std::ranges::stable_sort(m_frontier_during_bfs, {}, [&](const glm::ivec3& c) { return distance_squared(c, origin); });
 
     for (auto& q : m_gen_queues) q.clear();
     const u32 stamp = next_frontier_stamp();
@@ -361,22 +541,26 @@ void WorldManager::harvest_background_bfs(const glm::ivec3& origin, vulk::Vulkan
         m_gen_queues[target_lod - 1u].push_back(c);
     };
 
-    // Always seed the current near-origin region first even if the camera moved while the BFS was in flight
+    // Always seed the current near-origin region first
     for (const glm::ivec3& off : m_near_offsets)
     {
         const i32 y = origin.y + off.y;
         if (!is_y_in_world(y)) continue;
-        enqueue_candidate(glm::ivec3 {origin.x + off.x, y, origin.z + off.z});
+        const glm::ivec3 c {origin.x + off.x, y, origin.z + off.z};
+        grid[cell_index(c)].reached_faces |= inward_faces_toward_origin(c, origin);
+        enqueue_candidate(c);
     }
 
+    for (const glm::ivec3& c : m_reordered_candidates) enqueue_candidate(c);
     for (const glm::ivec3& c : m_frontier_during_bfs) enqueue_candidate(c);
     for (const glm::ivec3& c : m_bfs_out_candidates) enqueue_candidate(c);
 
+    m_reordered_candidates.clear();
     m_frontier_during_bfs.clear();
     m_bfs_out_candidates.clear();
     m_bfs_out_unwanted.clear();
 
-    // If any chunks were generated while the BFS was running, or a rerun was requested, schedule a follow-up BFS
+    // If any chunks were generated while the BFS was running, or a rerun was requested, schedule a followup BFS
     if (m_bfs_needs_rerun || m_current_epoch > m_bfs_start_epoch || origin != m_bfs_origin)
     {
         m_bfs_needs_rerun = false;
@@ -426,42 +610,58 @@ void WorldManager::execute_background_bfs()
         }
     };
 
-    // Every chunk in the near region is wanted because it is close enough to the camera
+    // Seed the near-camera region (<= NEAR_RADIUS)
+    // If any chunk in NEAR_RADIUS is still unloaded, treat it as open so the BFS continues into the surrounding loaded world and
+    // does not prematurely unload distant chunks
+    bool any_near_unloaded = false;
     for (const glm::ivec3& off : m_near_offsets)
     {
         const i32 y = origin.y + off.y;
         if (!is_y_in_world(y) || std::abs(off.x) > rd || std::abs(off.z) > rd) continue;
 
         const u32 idx = snap_idx(off.x, y, off.z);
-        if (visited.test_and_set(idx)) check_candidate(off.x, y, off.z, snap[idx]);
-    }
+        const u32 state = snap[idx];
+        const u32 tag = state & 0xFu;
+        const glm::ivec3 coord {origin.x + off.x, y, origin.z + off.z};
+        const u8 inward = inward_faces_toward_origin(coord, origin);
 
-    // Portal extension search starts at the camera chunk and traverses only connected face-to-face portals
-    if (is_y_in_world(origin.y))
-    {
-        const u32 origin_idx = snap_idx(0, origin.y, 0);
-        const u32 origin_state = snap[origin_idx];
-        snap[origin_idx] = origin_state | (static_cast<u32>(ALL_OPEN_FACES_MASK) << 25u);
+        snap[idx] = state | (static_cast<u32>(inward) << 25u);
+        if (visited.test_and_set(idx)) check_candidate(off.x, y, off.z, state);
 
-        const u32 origin_tag = origin_state & 0xFu;
-        if (origin_tag != GridCell::TAG_UNLOADED)
+        if (tag == GridCell::TAG_UNLOADED)
         {
-            const u32 origin_portals = (origin_state >> 4u) & GridCell::ALL_PORTALS;
-            const u8 origin_out = open_faces_mask(origin_portals);
-            if (origin_out != 0u)
+            any_near_unloaded = true;
+            m_bfs_queue.push_back(
+                SearchNode {
+                    .dx = static_cast<i16>(off.x),
+                    .dz = static_cast<i16>(off.z),
+                    .y = static_cast<i16>(y),
+                    .out_dirs = ALL_OPEN_FACES_MASK,
+                }
+            );
+        }
+        else
+        {
+            const u32 portals = (state >> 4u) & GridCell::ALL_PORTALS;
+            u8 out_dirs = 0u;
+            for (Direction in_dir : ALL_DIRECTIONS)
+                if ((inward & direction_bit(in_dir)) != 0u) out_dirs |= reachable_faces_from(portals, in_dir);
+
+            if (out_dirs != 0u)
             {
                 m_bfs_queue.push_back(
                     SearchNode {
-                        .dx = 0,
-                        .dz = 0,
-                        .y = static_cast<i16>(origin.y),
-                        .out_dirs = origin_out,
+                        .dx = static_cast<i16>(off.x),
+                        .dz = static_cast<i16>(off.z),
+                        .y = static_cast<i16>(y),
+                        .out_dirs = out_dirs,
                     }
                 );
             }
         }
     }
 
+    // Portal extension search traverses only connected face-to-face portals
     for (usize head = 0; head < m_bfs_queue.size(); ++head)
     {
         const SearchNode node = m_bfs_queue[head];
@@ -519,18 +719,21 @@ void WorldManager::execute_background_bfs()
         }
     }
 
-    // Identify any loaded cells in the active window that were not reached by the BFS
-    u32 idx = 0u;
-    for (i32 y = MIN_CHUNK_Y; y <= MAX_CHUNK_Y; ++y)
+    // Only unload unreachable cells when the entire NEAR_RADIUS camera neighborhood is loaded
+    if (!any_near_unloaded)
     {
-        for (i32 dz = -rd; dz <= rd; ++dz)
+        u32 idx = 0u;
+        for (i32 y = MIN_CHUNK_Y; y <= MAX_CHUNK_Y; ++y)
         {
-            for (i32 dx = -rd; dx <= rd; ++dx, ++idx)
+            for (i32 dz = -rd; dz <= rd; ++dz)
             {
-                const u32 state = snap[idx];
-                if ((state & 0xFu) == GridCell::TAG_UNLOADED) continue;
+                for (i32 dx = -rd; dx <= rd; ++dx, ++idx)
+                {
+                    const u32 state = snap[idx];
+                    if ((state & 0xFu) == GridCell::TAG_UNLOADED) continue;
 
-                if (!visited.test(idx)) m_bfs_out_unwanted.emplace_back(origin.x + dx, y, origin.z + dz);
+                    if (!visited.test(idx)) m_bfs_out_unwanted.emplace_back(origin.x + dx, y, origin.z + dz);
+                }
             }
         }
     }
@@ -549,6 +752,8 @@ u8 WorldManager::compute_allowed_out_dirs(const glm::ivec3& coord, u32 idx, Grid
         cell.reached_faces = ALL_OPEN_FACES_MASK;
         return open_faces_mask(portals);
     }
+
+    if (is_in_near_radius(coord, origin)) cell.reached_faces |= inward_faces_toward_origin(coord, origin);
 
     const u8 reached = static_cast<u8>(cell.reached_faces);
     if (reached == 0u) return 0u;
@@ -615,6 +820,10 @@ bool WorldManager::expand_frontier_from(const glm::ivec3& start_coord, const glm
                 if (high_priority)
                 {
                     m_urgent_gen_queue.push_back(ncoord);
+                    q.push_front(ncoord);
+                }
+                else if (target_lod <= 3u && !q.empty() && distance_squared(ncoord, origin) < distance_squared(q.front(), origin))
+                {
                     q.push_front(ncoord);
                 }
                 else
@@ -739,9 +948,9 @@ void WorldManager::unload_out_of_range(const glm::ivec3& new_origin, i32 new_rd,
     }
 }
 
-void WorldManager::start_background_gen(const glm::ivec3& origin)
+bool WorldManager::start_background_gen(const glm::ivec3& origin, bool urgent_only)
 {
-    if (m_gen_in_flight) return;
+    if (m_gen_in_flight) return false;
 
     u32 batch_work = 0;
     m_gen_batch.clear();
@@ -759,7 +968,7 @@ void WorldManager::start_background_gen(const glm::ivec3& origin)
             from_urgent = true;
             found = true;
         }
-        else
+        else if (!urgent_only)
         {
             for (u8 lod = 1; lod <= MAX_LOD; ++lod)
             {
@@ -809,10 +1018,17 @@ void WorldManager::start_background_gen(const glm::ivec3& origin)
         );
     }
 
-    if (m_gen_batch.empty()) return;
+    if (m_gen_batch.empty()) return false;
 
-    // Group chunks in the same column together so worker threads reuse 2D column noise
-    std::ranges::sort(m_gen_batch, [](const GenTaskItem& a, const GenTaskItem& b) {
+    // Build a column-grouped execution index order so worker threads reuse 2D column noise across vertical chunks
+    // while preserving the closest-first priority order of m_gen_batch for frontier expansion
+    const u32 count = static_cast<u32>(m_gen_batch.size());
+    m_gen_worker_order.resize(count);
+    for (u32 i = 0; i < count; ++i) m_gen_worker_order[i] = i;
+
+    std::ranges::sort(m_gen_worker_order, [&](u32 ia, u32 ib) {
+        const GenTaskItem& a = m_gen_batch[ia];
+        const GenTaskItem& b = m_gen_batch[ib];
         if (a.target_lod != b.target_lod) return a.target_lod < b.target_lod;
         if (a.coord.x != b.coord.x) return a.coord.x < b.coord.x;
         if (a.coord.z != b.coord.z) return a.coord.z < b.coord.z;
@@ -820,9 +1036,10 @@ void WorldManager::start_background_gen(const glm::ivec3& origin)
     });
 
     m_gen_in_flight = true;
-    m_gen_task.m_SetSize = static_cast<u32>(m_gen_batch.size());
-    m_gen_task.m_MinRange = std::max(1u, m_gen_task.m_SetSize / 4u);
+    m_gen_task.m_SetSize = count;
+    m_gen_task.m_MinRange = std::max(1u, count / 4u);
     m_scheduler.AddTaskSetToPipe(&m_gen_task);
+    return true;
 }
 
 void WorldManager::execute_background_gen(enki::TaskSetPartition range, u32 threadnum)
@@ -830,7 +1047,7 @@ void WorldManager::execute_background_gen(enki::TaskSetPartition range, u32 thre
     ChunkGenerator& gen = m_worker_generators[threadnum % m_worker_generators.size()];
     for (u32 i = range.start; i < range.end; ++i)
     {
-        GenTaskItem& item = m_gen_batch[i];
+        GenTaskItem& item = m_gen_batch[m_gen_worker_order[i]];
         std::visit(
             [&](auto& chunk) {
                 item.non_air = gen.generate(chunk, item.guaranteed_all_lods, item.column_max_height);
@@ -916,17 +1133,18 @@ void WorldManager::harvest_background_gen(const glm::ivec3& origin, i32 rd, vulk
             item.committed = true;
         }
 
-        // If the camera moved while this batch was generating so an even finer LOD is now needed, queue a follow-up
         if (cell.needs_lod_update(current_target_lod)) m_gen_queues[current_target_lod - 1u].push_front(item.coord);
     }
 
-    // Pass 1: expand frontier for newly opened portals, fill sky air columns, and notify neighbors to remesh
+    // Pass 1: sync entry faces from loaded neighbors, fill sky air columns, expand frontier, and notify neighbors to remesh
     for (const GenTaskItem& item : m_gen_batch)
     {
         if (!item.committed || !is_in_active_window(item.coord)) continue;
 
         const u32 idx = cell_index(item.coord);
         GridCell& cell = m_grid[idx];
+        sync_cell_reached_from_neighbors(item.coord, cell, origin);
+
         const u32 newly_closed_portals = item.old_portal_mask & ~item.portal_mask;
 
         const u8 allowed_out = compute_allowed_out_dirs(item.coord, idx, cell, origin);
@@ -989,11 +1207,12 @@ void WorldManager::mark_dirty(const glm::ivec3& coord)
     });
 }
 
-void WorldManager::start_background_mesh()
+bool WorldManager::start_background_mesh(const glm::ivec3& origin)
 {
-    if (m_mesh_in_flight) return;
+    if (m_mesh_in_flight) return false;
 
     m_mesh_batch.clear();
+    m_deferred_remeshes.clear();
     u32 mesh_work = 0;
 
     while (mesh_work < MESH_WORK_BUDGET_PER_BATCH && m_mesh_batch.size() < MAX_MESH_BATCH_CHUNKS)
@@ -1024,26 +1243,39 @@ void WorldManager::start_background_mesh()
         }
 
         if (!found) break;
+        if (!is_in_active_window(coord)) continue;
 
-        const GridCell* cell = find_real_cell(coord);
-        if (cell == nullptr) continue;
+        const u32 idx = cell_index(coord);
+        GridCell& cell = m_grid[idx];
+        if (!cell.is_real()) continue;
 
-        const bool queued = m_pools.visit_lod(cell->lod(), [&](auto& pool) {
-            auto& chunk = pool.chunk_at(cell->index);
+        bool has_inherited_gpu_mesh = false;
+        const bool is_dirty = m_pools.visit_lod(cell.lod(), [&](auto& pool) {
+            auto& chunk = pool.chunk_at(cell.index);
             if (!chunk.mesh_dirty) return false;
-            chunk.mesh_dirty = false;
+            has_inherited_gpu_mesh = pool.mesh_at(cell.index).vertex_buffer.is_valid();
             return true;
         });
 
-        if (!queued) continue;
+        if (!is_dirty) continue;
 
-        mesh_work += lod_work_cost(cell->lod());
+        // If this chunk already has a visible GPU mesh and an open portal neighbor is still unloaded,
+        // keep the existing mesh on screen until that neighbor is generated so no hole appears
+        if (has_inherited_gpu_mesh && has_unloaded_portal_neighbor(coord, idx, cell, origin))
+        {
+            m_deferred_remeshes.push_back(coord);
+            continue;
+        }
+
+        m_pools.visit_lod(cell.lod(), [&](auto& pool) { pool.chunk_at(cell.index).mesh_dirty = false; });
+
+        mesh_work += lod_work_cost(cell.lod());
 
         const usize batch_idx = m_mesh_batch.size();
         MeshTaskItem item {
             .coord = coord,
-            .slot = cell->index,
-            .lod = cell->lod(),
+            .slot = cell.index,
+            .lod = cell.lod(),
             .neighbors = get_mesh_neighbors(coord),
             .staged_mesh = {},
         };
@@ -1051,12 +1283,22 @@ void WorldManager::start_background_mesh()
         m_mesh_batch.push_back(std::move(item));
     }
 
-    if (m_mesh_batch.empty()) return;
+    // Re-queue any deferred remeshes so they are processed as soon as their urgent neighbor finishes generating
+    for (usize i = m_deferred_remeshes.size(); i > 0u; --i)
+    {
+        const glm::ivec3& c = m_deferred_remeshes[i - 1u];
+        const GridCell* cell = find_real_cell(c);
+        if (cell != nullptr) m_remesh_queues[cell->lod() - 1u].push_front(c);
+    }
+    m_deferred_remeshes.clear();
+
+    if (m_mesh_batch.empty()) return false;
 
     m_mesh_in_flight = true;
     m_mesh_task.m_SetSize = static_cast<u32>(m_mesh_batch.size());
     m_mesh_task.m_MinRange = std::max(1u, m_mesh_task.m_SetSize / 4u);
     m_scheduler.AddTaskSetToPipe(&m_mesh_task);
+    return true;
 }
 
 void WorldManager::execute_background_mesh(enki::TaskSetPartition range, u32)
@@ -1071,11 +1313,10 @@ void WorldManager::execute_background_mesh(enki::TaskSetPartition range, u32)
     }
 }
 
-void WorldManager::harvest_background_mesh(vulk::VulkanContext& ctx)
+void WorldManager::harvest_background_mesh(vulk::VulkanContext& ctx, u64& inout_uploaded_bytes)
 {
     m_mesh_in_flight = false;
 
-    u64 uploaded_bytes = 0;
     for (usize i = 0; i < m_mesh_batch.size(); ++i)
     {
         MeshTaskItem& item = m_mesh_batch[i];
@@ -1088,7 +1329,7 @@ void WorldManager::harvest_background_mesh(vulk::VulkanContext& ctx)
                 ChunkMesh& mesh = pool.mesh_at(item.slot);
                 const u64 mesh_bytes = item.staged_mesh.vertices.size() * sizeof(PackedVertex);
 
-                if (uploaded_bytes > 0u && uploaded_bytes + mesh_bytes > MAX_UPLOAD_BYTES_PER_FRAME)
+                if (inout_uploaded_bytes > 0u && inout_uploaded_bytes + mesh_bytes > MAX_UPLOAD_BYTES_PER_FRAME)
                 {
                     chunk.mesh_dirty = true;
                     m_remesh_queues[item.lod - 1u].push_front(item.coord);
@@ -1099,7 +1340,7 @@ void WorldManager::harvest_background_mesh(vulk::VulkanContext& ctx)
                 mesh.quad_count = item.staged_mesh.quad_count;
                 mesh.coord = item.coord;
                 mesh.upload_to_gpu(ctx);
-                uploaded_bytes += mesh_bytes;
+                inout_uploaded_bytes += mesh_bytes;
                 mesh.vertices.clear();
                 std::swap(mesh.vertices, item.staged_mesh.vertices);
                 mesh.meshed_once = true;

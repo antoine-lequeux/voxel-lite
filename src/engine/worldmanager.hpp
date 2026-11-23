@@ -1,7 +1,7 @@
 #pragma once
 
-#include "generation/chunkgenerator.hpp"
 #include "containers.hpp"
+#include "generation/chunkgenerator.hpp"
 
 #include <TaskScheduler.h>
 
@@ -14,11 +14,16 @@ namespace vl
 inline constexpr i32 NEAR_RADIUS = 3;
 inline constexpr u32 MAX_WORKER_THREAD_COUNT = 4;
 
-// Budgets
+// CPU budgets per frame
+inline constexpr f64 GEN_TIME_BUDGET_MS = 7.5;
+inline constexpr f64 URGENT_GEN_EXTRA_BUDGET_MS = 2.0;
+inline constexpr f64 FRAME_WORK_TIME_BUDGET_MS = 12.0;
 inline constexpr f64 BFS_MIN_INTERVAL_MS = 50.0;
-inline constexpr u32 GEN_WORK_BUDGET_PER_BATCH = 2048;
-inline constexpr u32 MESH_WORK_BUDGET_PER_BATCH = 2048;
-inline constexpr u32 MAX_GEN_BATCH_CHUNKS = 64;
+
+// Micro-batch budgets
+inline constexpr u32 GEN_WORK_BUDGET_PER_BATCH = 384;
+inline constexpr u32 MESH_WORK_BUDGET_PER_BATCH = 512;
+inline constexpr u32 MAX_GEN_BATCH_CHUNKS = 48;
 inline constexpr u32 MAX_MESH_BATCH_CHUNKS = 64;
 inline constexpr u64 MAX_UPLOAD_BYTES_PER_FRAME = 16ull * 1024ull * 1024ull;
 
@@ -248,7 +253,7 @@ private:
     {
         WorldManager* manager = nullptr;
 
-        explicit BackgroundGenTask(WorldManager* mgr) : enki::ITaskSet(1), manager(mgr) { m_Priority = enki::TASK_PRIORITY_MED; }
+        explicit BackgroundGenTask(WorldManager* mgr) : enki::ITaskSet(1), manager(mgr) { m_Priority = enki::TASK_PRIORITY_HIGH; }
 
         void ExecuteRange(enki::TaskSetPartition range, u32 threadnum) override
         {
@@ -289,6 +294,31 @@ private:
             case 4: return init_staged_chunk<4>(coord);
             default: return init_staged_chunk<5>(coord);
         }
+    }
+
+    // Returns the face bitmask of 'coord' that points back toward 'origin' (or all 6 faces at origin)
+    [[nodiscard]] static constexpr u8 inward_faces_toward_origin(const glm::ivec3& coord, const glm::ivec3& origin)
+    {
+        const i32 dx = coord.x - origin.x;
+        const i32 dy = coord.y - origin.y;
+        const i32 dz = coord.z - origin.z;
+
+        if (dx == 0 && dy == 0 && dz == 0) return ALL_OPEN_FACES_MASK;
+
+        u8 mask = 0u;
+        if (dx > 0) mask |= direction_bit(Direction::Left);
+        if (dx < 0) mask |= direction_bit(Direction::Right);
+        if (dy > 0) mask |= direction_bit(Direction::Down);
+        if (dy < 0) mask |= direction_bit(Direction::Up);
+        if (dz > 0) mask |= direction_bit(Direction::Back);
+        if (dz < 0) mask |= direction_bit(Direction::Front);
+        return mask;
+    }
+
+    [[nodiscard]] static constexpr bool is_in_near_radius(const glm::ivec3& coord, const glm::ivec3& origin)
+    {
+        return std::abs(coord.x - origin.x) <= NEAR_RADIUS && std::abs(coord.y - origin.y) <= NEAR_RADIUS &&
+               std::abs(coord.z - origin.z) <= NEAR_RADIUS;
     }
 
     [[nodiscard]] static constexpr i32 wrap_xz(i32 v)
@@ -399,16 +429,20 @@ private:
 
     void wait_for_all_tasks();
 
+    void refresh_queues_for_new_origin(const glm::ivec3& old_origin, const glm::ivec3& new_origin, i32 rd, bool had_old_origin);
+    void sync_cell_reached_from_neighbors(const glm::ivec3& coord, GridCell& cell, const glm::ivec3& origin);
+    [[nodiscard]] bool has_unloaded_portal_neighbor(const glm::ivec3& coord, u32 idx, GridCell& cell, const glm::ivec3& origin);
+
     void start_background_bfs(const glm::ivec3& origin, i32 rd);
     void harvest_background_bfs(const glm::ivec3& origin, vulk::VulkanContext& ctx);
     void execute_background_bfs();
 
-    void start_background_gen(const glm::ivec3& origin);
+    bool start_background_gen(const glm::ivec3& origin, bool urgent_only = false);
     void harvest_background_gen(const glm::ivec3& origin, i32 rd, vulk::VulkanContext& ctx);
     void execute_background_gen(enki::TaskSetPartition range, u32 threadnum);
 
-    void start_background_mesh();
-    void harvest_background_mesh(vulk::VulkanContext& ctx);
+    bool start_background_mesh(const glm::ivec3& origin);
+    void harvest_background_mesh(vulk::VulkanContext& ctx, u64& inout_uploaded_bytes);
     void execute_background_mesh(enki::TaskSetPartition range, u32 threadnum);
 
     // Computes the outgoing directions of 'cell' that are connected to its reached entry faces (or all open faces at origin)
@@ -457,6 +491,8 @@ private:
     // Per-LOD generation and meshing queues (index 0 = LOD 1, index MAX_LOD-1 = LOD 5)
     std::deque<glm::ivec3> m_urgent_gen_queue {};
     std::array<std::deque<glm::ivec3>, MAX_LOD> m_gen_queues {};
+    std::vector<glm::ivec3> m_reordered_candidates {};
+    std::vector<glm::ivec3> m_deferred_remeshes {};
     std::vector<glm::ivec3> m_frontier_during_bfs {};
     std::vector<SearchNode> m_expand_stack {};
     std::vector<glm::ivec3> m_near_offsets {};
@@ -472,6 +508,7 @@ private:
     enki::TaskScheduler m_scheduler {};
     std::vector<ChunkGenerator> m_worker_generators {};
     std::vector<GenTaskItem> m_gen_batch {};
+    std::vector<u32> m_gen_worker_order {};
     std::vector<MeshTaskItem> m_mesh_batch {};
     std::array<std::vector<PackedVertex>, MAX_MESH_BATCH_CHUNKS> m_mesh_vertex_scratch {};
 
